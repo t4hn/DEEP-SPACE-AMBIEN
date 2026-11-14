@@ -1,0 +1,6 @@
+{
+  "name": "DEEP SPACE",
+  "description": "Atmospheric shipboard ambient audio mixer built with the Web Audio API.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
