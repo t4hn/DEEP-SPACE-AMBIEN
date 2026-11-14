@@ -72,7 +72,7 @@ export default function App() {
     const updateMeters = () => {
       const engine = engineRef.current;
       const current = stateRef.current;
-      if (engine && current.isActive) {
+      if (engine && current.isActive && !document.hidden) {
         const levels = engine.getChannelLevels(current);
         for (const ch of CHANNELS) {
           const el = meterRefs.current[ch.id].current;
@@ -81,14 +81,46 @@ export default function App() {
           el.style.transform = `scaleX(${level.toFixed(3)})`;
         }
       }
-      rafId = window.requestAnimationFrame(updateMeters);
+      if (!document.hidden) {
+        rafId = window.requestAnimationFrame(updateMeters);
+      } else {
+        rafId = 0;
+      }
     };
 
-    rafId = window.requestAnimationFrame(updateMeters);
+    const handleVisibility = () => {
+      if (!document.hidden && rafId === 0 && stateRef.current.isActive) {
+        rafId = window.requestAnimationFrame(updateMeters);
+      } else if (document.hidden && rafId !== 0) {
+        window.cancelAnimationFrame(rafId);
+        rafId = 0;
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    if (!document.hidden) {
+      rafId = window.requestAnimationFrame(updateMeters);
+    }
+
     return () => {
-      window.cancelAnimationFrame(rafId);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      if (rafId !== 0) {
+        window.cancelAnimationFrame(rafId);
+      }
     };
   }, [state.isActive, state.channels]);
+
+  const handlePlayAll = () => {
+    engineRef.current?.unlockFromGesture();
+    dispatch({ type: 'PLAY_ALL' });
+  };
+
+  const handleToggleChannel = (channelId: ChannelId) => {
+    if (!state.channels[channelId].enabled) {
+      engineRef.current?.unlockFromGesture();
+    }
+    dispatch({ type: 'TOGGLE_CHANNEL', channelId });
+  };
 
   const activeChannelCount = countEnabledChannels(state);
 
@@ -131,7 +163,7 @@ export default function App() {
             masterVolume={state.masterVolume}
             activeChannelCount={activeChannelCount}
             totalChannels={CHANNELS.length}
-            onPlayAll={() => dispatch({ type: 'PLAY_ALL' })}
+            onPlayAll={handlePlayAll}
             onStopAll={() => dispatch({ type: 'STOP_ALL' })}
             onReset={() => dispatch({ type: 'RESET' })}
             onMasterVolumeChange={(volume) =>
@@ -149,7 +181,7 @@ export default function App() {
               state={state.channels[ch.id]}
               environmentActive={state.isActive}
               meterRef={meterRefs.current[ch.id]}
-              onToggle={() => dispatch({ type: 'TOGGLE_CHANNEL', channelId: ch.id })}
+              onToggle={() => handleToggleChannel(ch.id)}
               onVolumeChange={(volume) =>
                 dispatch({
                   type: 'SET_CHANNEL_VOLUME',
