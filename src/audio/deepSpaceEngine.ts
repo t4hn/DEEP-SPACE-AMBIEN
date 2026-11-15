@@ -12,6 +12,21 @@ import {
   effectiveChannelGain,
   sliderToGain,
 } from './mixerState';
+import {
+  CHANNEL_SPATIAL_PROFILES,
+  type ChannelSpatialProfile,
+  LISTENER_FORWARD,
+  LISTENER_POSITION,
+  LISTENER_UP,
+  type SpatialTrajectory,
+  type SpatialVec3,
+  computeDistanceAttenuation,
+  computeDistanceLowpassHz,
+  computeFallbackStereoPan,
+  sampleCommunicationsTrajectory,
+  sampleHullSurroundingTrajectory,
+  sampleSystemsTransientPosition,
+} from './spatialLayout';
 
 interface ChannelAudioNodes {
   gain: GainNode;
@@ -20,6 +35,24 @@ interface ChannelAudioNodes {
   start?: () => void;
   stop?: () => void;
   cleanup: () => void;
+}
+
+interface SpatialVoiceConfig {
+  startPos: SpatialVec3;
+  endPos?: SpatialVec3;
+  startTime?: number;
+  durationSec?: number;
+  panningModel: 'HRTF' | 'equalpower';
+  refDistance: number;
+  maxDistance: number;
+  rolloffFactor: number;
+  distanceGain?: number;
+  airAbsorptionHz?: number | null;
+}
+
+interface SpatialBusHandle {
+  input: AudioNode;
+  disconnect: () => void;
 }
 
 export interface DeepSpaceEngineOptions {
@@ -97,6 +130,206 @@ function smoothSetParam(param: AudioParam, target: number, now: number, timeCons
   param.cancelScheduledValues(now);
   param.setValueAtTime(param.value, now);
   param.setTargetAtTime(target, now, timeConstant);
+}
+
+/**
+ * Configures the Web Audio AudioListener at the center of the spacecraft's
+ * operational area facing forward (-Z), supporting both modern AudioParam
+ * properties and legacy setter methods.
+ */
+function configureSpatialListener(ctx: AudioContext): void {
+  const listener = ctx.listener as AudioListener & {
+    setPosition?: (x: number, y: number, z: number) => void;
+    setOrientation?: (
+      fx: number,
+      fy: number,
+      fz: number,
+      ux: number,
+      uy: number,
+      uz: number,
+    ) => void;
+  };
+  if (!listener) return;
+
+  const now = ctx.currentTime;
+  try {
+    if ('positionX' in listener && listener.positionX) {
+      listener.positionX.setValueAtTime(LISTENER_POSITION.x, now);
+      listener.positionY.setValueAtTime(LISTENER_POSITION.y, now);
+      listener.positionZ.setValueAtTime(LISTENER_POSITION.z, now);
+    } else if (typeof listener.setPosition === 'function') {
+      listener.setPosition(LISTENER_POSITION.x, LISTENER_POSITION.y, LISTENER_POSITION.z);
+    }
+
+    if ('forwardX' in listener && listener.forwardX && listener.upX) {
+      listener.forwardX.setValueAtTime(LISTENER_FORWARD.x, now);
+      listener.forwardY.setValueAtTime(LISTENER_FORWARD.y, now);
+      listener.forwardZ.setValueAtTime(LISTENER_FORWARD.z, now);
+      listener.upX.setValueAtTime(LISTENER_UP.x, now);
+      listener.upY.setValueAtTime(LISTENER_UP.y, now);
+      listener.upZ.setValueAtTime(LISTENER_UP.z, now);
+    } else if (typeof listener.setOrientation === 'function') {
+      listener.setOrientation(
+        LISTENER_FORWARD.x,
+        LISTENER_FORWARD.y,
+        LISTENER_FORWARD.z,
+        LISTENER_UP.x,
+        LISTENER_UP.y,
+        LISTENER_UP.z,
+      );
+    }
+  } catch {
+    // Ignore unsupported listener mutations in constrained Web Audio implementations
+  }
+}
+
+function setPannerPositionAt(panner: PannerNode, pos: SpatialVec3, time: number): void {
+  if ('positionX' in panner && panner.positionX) {
+    panner.positionX.setValueAtTime(pos.x, time);
+    panner.positionY.setValueAtTime(pos.y, time);
+    panner.positionZ.setValueAtTime(pos.z, time);
+  } else {
+    const legacy = panner as PannerNode & {
+      setPosition?: (x: number, y: number, z: number) => void;
+    };
+    if (typeof legacy.setPosition === 'function') {
+      legacy.setPosition(pos.x, pos.y, pos.z);
+    }
+  }
+}
+
+function rampPannerPositionTo(panner: PannerNode, pos: SpatialVec3, endTime: number): void {
+  if ('positionX' in panner && panner.positionX) {
+    panner.positionX.linearRampToValueAtTime(pos.x, endTime);
+    panner.positionY.linearRampToValueAtTime(pos.y, endTime);
+    panner.positionZ.linearRampToValueAtTime(pos.z, endTime);
+  }
+}
+
+/**
+ * Creates a safe 3D spatial bus routing `input -> [optional air-absorption lowpass] ->
+ * [distance trim] -> PannerNode (HRTF or equalpower) -> dest`, falling back cleanly to
+ * StereoPannerNode + distance GainNode if PannerNode or HRTF is unsupported.
+ */
+function createSpatialBus(
+  ctx: AudioContext,
+  dest: AudioNode,
+  config: SpatialVoiceConfig,
+): SpatialBusHandle {
+  const {
+    startPos,
+    endPos,
+    startTime = ctx.currentTime,
+    durationSec = 0,
+    panningModel,
+    refDistance,
+    maxDistance,
+    rolloffFactor,
+    distanceGain = 1,
+    airAbsorptionHz = null,
+  } = config;
+
+  const chain: AudioNode[] = [];
+
+  if (airAbsorptionHz !== null) {
+    const airFilter = ctx.createBiquadFilter();
+    airFilter.type = 'lowpass';
+    airFilter.frequency.value = airAbsorptionHz;
+    airFilter.Q.value = 0.65;
+    chain.push(airFilter);
+  }
+
+  let usedPanner = false;
+  if (typeof ctx.createPanner === 'function') {
+    try {
+      const panner = ctx.createPanner();
+      panner.distanceModel = 'inverse';
+      panner.refDistance = refDistance;
+      panner.maxDistance = maxDistance;
+      panner.rolloffFactor = rolloffFactor;
+      panner.coneInnerAngle = 360;
+      panner.coneOuterAngle = 360;
+      panner.coneOuterGain = 0;
+
+      try {
+        panner.panningModel = panningModel;
+      } catch {
+        panner.panningModel = 'equalpower';
+      }
+
+      setPannerPositionAt(panner, startPos, startTime);
+      if (
+        endPos &&
+        durationSec > 0.05 &&
+        (endPos.x !== startPos.x || endPos.y !== startPos.y || endPos.z !== startPos.z)
+      ) {
+        rampPannerPositionTo(panner, endPos, startTime + durationSec);
+      }
+
+      if (distanceGain !== 1) {
+        const trim = ctx.createGain();
+        trim.gain.value = distanceGain;
+        chain.push(trim);
+      }
+      chain.push(panner);
+      usedPanner = true;
+    } catch {
+      // Fall through to StereoPannerNode fallback
+    }
+  }
+
+  if (!usedPanner) {
+    const attenGain = ctx.createGain();
+    const startAtten = computeDistanceAttenuation(startPos, refDistance, rolloffFactor) * distanceGain;
+    attenGain.gain.setValueAtTime(startAtten, startTime);
+    if (endPos && durationSec > 0.05) {
+      const endAtten = computeDistanceAttenuation(endPos, refDistance, rolloffFactor) * distanceGain;
+      attenGain.gain.linearRampToValueAtTime(endAtten, startTime + durationSec);
+    }
+    chain.push(attenGain);
+
+    if (typeof ctx.createStereoPanner === 'function') {
+      const stereo = ctx.createStereoPanner();
+      stereo.pan.setValueAtTime(computeFallbackStereoPan(startPos), startTime);
+      if (
+        endPos &&
+        durationSec > 0.05 &&
+        (endPos.x !== startPos.x || endPos.z !== startPos.z)
+      ) {
+        stereo.pan.linearRampToValueAtTime(
+          computeFallbackStereoPan(endPos),
+          startTime + durationSec,
+        );
+      }
+      chain.push(stereo);
+    }
+  }
+
+  if (chain.length > 0) {
+    for (let i = 0; i < chain.length - 1; i += 1) {
+      chain[i].connect(chain[i + 1]);
+    }
+    chain[chain.length - 1].connect(dest);
+    return {
+      input: chain[0],
+      disconnect: () => {
+        for (const node of chain) {
+          node.disconnect();
+        }
+      },
+    };
+  }
+
+  // Ultimate passthrough safeguard
+  const passthrough = ctx.createGain();
+  passthrough.gain.value = distanceGain;
+  passthrough.connect(dest);
+  return {
+    input: passthrough,
+    disconnect: () => {
+      passthrough.disconnect();
+    },
+  };
 }
 
 /**
@@ -187,6 +420,9 @@ export class DeepSpaceEngine {
     if (this.latestState.channels.communications.enabled) {
       this.channels.communications?.start?.();
     }
+    if (this.latestState.channels.hull.enabled) {
+      this.channels.hull?.start?.();
+    }
     // Resume ambient event scheduling with a fresh delay (never firing immediately on tab return)
     if (this.latestState.ambientEventsEnabled && this.eventTimerId === null) {
       this.scheduleNextAmbientEvent(true);
@@ -268,6 +504,8 @@ export class DeepSpaceEngine {
     masterGain.connect(compressor);
     compressor.connect(ctx.destination);
 
+    configureSpatialListener(ctx);
+
     this.ctx = ctx;
     this.masterGain = masterGain;
     this.compressor = compressor;
@@ -277,23 +515,37 @@ export class DeepSpaceEngine {
     this.channels.ventilation = this.buildVentilationChannel(ctx, masterGain);
     this.channels.systems = this.buildSystemsChannel(ctx, masterGain);
     this.channels.communications = this.buildCommunicationsChannel(ctx, masterGain);
+    this.channels.hull = this.buildHullChannel(ctx, masterGain);
 
     return ctx;
   }
 
-  private createChannelBus(ctx: AudioContext, destination: AudioNode): {
+  private createChannelBus(
+    ctx: AudioContext,
+    destination: AudioNode,
+    channelId: ChannelId,
+  ): {
     input: GainNode;
+    spatialInput: GainNode;
     eventBus: GainNode;
     outputGain: GainNode;
     analyser: AnalyserNode;
+    spatialProfile: ChannelSpatialProfile;
     disconnectBus: () => void;
   } {
+    const spatialProfile = CHANNEL_SPATIAL_PROFILES[channelId];
+
+    // Continuous bed path: input -> channel spatial panner -> outputGain
     const input = ctx.createGain();
     input.gain.value = 1;
 
+    // Pre-spatialized transient & ambient-event path avoids double-panning
+    const spatialInput = ctx.createGain();
+    spatialInput.gain.value = 1;
+
     const eventBus = ctx.createGain();
     eventBus.gain.value = 1;
-    eventBus.connect(input);
+    eventBus.connect(spatialInput);
 
     const outputGain = ctx.createGain();
     outputGain.gain.value = 0;
@@ -302,18 +554,33 @@ export class DeepSpaceEngine {
     analyser.fftSize = 256;
     analyser.smoothingTimeConstant = 0.78;
 
-    input.connect(outputGain);
+    const bedSpatial = createSpatialBus(ctx, outputGain, {
+      startPos: spatialProfile.position,
+      panningModel: spatialProfile.panningModel,
+      refDistance: spatialProfile.refDistance,
+      maxDistance: spatialProfile.maxDistance,
+      rolloffFactor: spatialProfile.rolloffFactor,
+      distanceGain: spatialProfile.distanceGain,
+      airAbsorptionHz: spatialProfile.airAbsorptionHz,
+    });
+
+    input.connect(bedSpatial.input);
+    spatialInput.connect(outputGain);
     outputGain.connect(analyser);
     analyser.connect(destination);
 
     return {
       input,
+      spatialInput,
       eventBus,
       outputGain,
       analyser,
+      spatialProfile,
       disconnectBus: () => {
         eventBus.disconnect();
+        spatialInput.disconnect();
         input.disconnect();
+        bedSpatial.disconnect();
         outputGain.disconnect();
         analyser.disconnect();
       },
@@ -324,7 +591,11 @@ export class DeepSpaceEngine {
    * CH-01: Reactor — Deep, warm, continuous mechanical hum with subtle fluctuations
    */
   private buildReactorChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
-    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
+    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(
+      ctx,
+      dest,
+      'reactor',
+    );
 
     // Subsonic highpass removes DC / ultra-low mud without thinning the 52 Hz core
     const subsonicFilter = ctx.createBiquadFilter();
@@ -431,7 +702,11 @@ export class DeepSpaceEngine {
    * CH-02: Engines — Layered, low-frequency mechanical rumble
    */
   private buildEnginesChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
-    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
+    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(
+      ctx,
+      dest,
+      'engines',
+    );
 
     const subsonicHp = ctx.createBiquadFilter();
     subsonicHp.type = 'highpass';
@@ -537,7 +812,11 @@ export class DeepSpaceEngine {
    * CH-03: Ventilation — Soft, consistent airflow without excessive high-frequency noise
    */
   private buildVentilationChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
-    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
+    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(
+      ctx,
+      dest,
+      'ventilation',
+    );
 
     const highpass = ctx.createBiquadFilter();
     highpass.type = 'highpass';
@@ -626,19 +905,33 @@ export class DeepSpaceEngine {
    * D. Diagnostic Sequences (coherent multi-note system check routines)
    */
   private buildSystemsChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
-    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
+    const {
+      input,
+      spatialInput,
+      eventBus,
+      outputGain,
+      analyser,
+      spatialProfile,
+      disconnectBus,
+    } = this.createChannelBus(ctx, dest, 'systems');
 
-    // Master lowpass keeps all computational activity warm and non-fatiguing
+    // Master lowpass keeps continuous computational bed warm and non-fatiguing
     const busToneFilter = ctx.createBiquadFilter();
     busToneFilter.type = 'lowpass';
     busToneFilter.frequency.value = 1280;
     busToneFilter.Q.value = 0.65;
     busToneFilter.connect(input);
 
-    // Sub-gate for transient voices so disabling Systems fades out smoothly with zero clicks
+    // Sub-gate for 3D-spatialized transient voices (bypasses bed panner to preserve HRTF image)
+    const activityToneFilter = ctx.createBiquadFilter();
+    activityToneFilter.type = 'lowpass';
+    activityToneFilter.frequency.value = 1280;
+    activityToneFilter.Q.value = 0.65;
+    activityToneFilter.connect(spatialInput);
+
     const activityGain = ctx.createGain();
     activityGain.gain.value = 0;
-    activityGain.connect(busToneFilter);
+    activityGain.connect(activityToneFilter);
 
     // --- Layer A: Background Processing (continuous electronic computing texture) ---
     const procFilter = ctx.createBiquadFilter();
@@ -757,29 +1050,29 @@ export class DeepSpaceEngine {
       freq: number,
       duration: number,
       peakGain: number,
-      panVal: number,
+      position: SpatialVec3,
       harmonicBlend = 0,
     ) => {
       const osc = ctx.createOscillator();
       const env = ctx.createGain();
-      const pan = ctx.createStereoPanner();
+      const spatial = createSpatialBus(ctx, activityGain, {
+        startPos: position,
+        startTime: start,
+        panningModel: 'HRTF',
+        refDistance: spatialProfile.refDistance,
+        maxDistance: spatialProfile.maxDistance,
+        rolloffFactor: spatialProfile.rolloffFactor,
+        distanceGain: spatialProfile.distanceGain,
+      });
 
       osc.type = 'sine';
       osc.frequency.value = freq;
-      pan.pan.value = panVal;
 
       env.gain.setValueAtTime(0.0001, start);
       env.gain.linearRampToValueAtTime(peakGain, start + 0.012);
       env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
 
-      osc.connect(env).connect(pan).connect(activityGain);
-      voices.track(osc, () => {
-        osc.disconnect();
-        env.disconnect();
-        pan.disconnect();
-      });
-      osc.start(start);
-      osc.stop(start + duration + 0.025);
+      osc.connect(env).connect(spatial.input);
 
       if (harmonicBlend > 0) {
         const sub = ctx.createOscillator();
@@ -789,17 +1082,46 @@ export class DeepSpaceEngine {
         subEnv.gain.setValueAtTime(0.0001, start);
         subEnv.gain.linearRampToValueAtTime(peakGain * harmonicBlend, start + 0.015);
         subEnv.gain.exponentialRampToValueAtTime(0.0001, start + duration);
-        sub.connect(subEnv).connect(pan);
+        sub.connect(subEnv).connect(spatial.input);
+
+        let remaining = 2;
+        const releaseSpatial = () => {
+          remaining -= 1;
+          if (remaining <= 0) {
+            spatial.disconnect();
+          }
+        };
+        voices.track(osc, () => {
+          osc.disconnect();
+          env.disconnect();
+          releaseSpatial();
+        });
         voices.track(sub, () => {
           sub.disconnect();
           subEnv.disconnect();
+          releaseSpatial();
         });
+        osc.start(start);
+        osc.stop(start + duration + 0.025);
         sub.start(start);
         sub.stop(start + duration + 0.025);
+      } else {
+        voices.track(osc, () => {
+          osc.disconnect();
+          env.disconnect();
+          spatial.disconnect();
+        });
+        osc.start(start);
+        osc.stop(start + duration + 0.025);
       }
     };
 
-    const spawnRelayTick = (start: number, centerFreq: number, peakGain: number, panVal: number) => {
+    const spawnRelayTick = (
+      start: number,
+      centerFreq: number,
+      peakGain: number,
+      position: SpatialVec3,
+    ) => {
       const src = ctx.createBufferSource();
       src.buffer = relayBuf;
 
@@ -811,15 +1133,22 @@ export class DeepSpaceEngine {
       const env = ctx.createGain();
       env.gain.value = peakGain;
 
-      const pan = ctx.createStereoPanner();
-      pan.pan.value = panVal;
+      const spatial = createSpatialBus(ctx, activityGain, {
+        startPos: position,
+        startTime: start,
+        panningModel: 'HRTF',
+        refDistance: spatialProfile.refDistance,
+        maxDistance: spatialProfile.maxDistance,
+        rolloffFactor: spatialProfile.rolloffFactor,
+        distanceGain: spatialProfile.distanceGain,
+      });
 
-      src.connect(bp).connect(env).connect(pan).connect(activityGain);
+      src.connect(bp).connect(env).connect(spatial.input);
       voices.track(src, () => {
         src.disconnect();
         bp.disconnect();
         env.disconnect();
-        pan.disconnect();
+        spatial.disconnect();
       });
       src.start(start);
       src.stop(start + 0.036);
@@ -850,7 +1179,7 @@ export class DeepSpaceEngine {
           const contour = diagnosticContours[contourIdx];
           const stepSec = 0.145 + Math.random() * 0.03;
           const transpose = Math.random() < 0.5 ? 1 : 0.8909; // G4 or F4 root center
-          const panVal = (Math.random() - 0.5) * 0.28;
+          const pos = sampleSystemsTransientPosition();
 
           for (let i = 0; i < contour.length; i += 1) {
             const isFinal = i === contour.length - 1;
@@ -860,7 +1189,7 @@ export class DeepSpaceEngine {
               freq,
               isFinal ? 0.24 : 0.14,
               isFinal ? 0.056 : 0.044,
-              panVal,
+              pos,
               0.22,
             );
           }
@@ -870,38 +1199,37 @@ export class DeepSpaceEngine {
 
           if (roll < 0.46) {
             // Layer B: Telemetry pulse / confirmation pair or register burst
+            const pos = sampleSystemsTransientPosition();
             if (Math.random() < 0.65) {
               const baseIdx = Math.floor(Math.random() * scale.length);
               const secondIdx = (baseIdx + (Math.random() < 0.6 ? 2 : 1)) % scale.length;
-              const panVal = (Math.random() - 0.5) * 0.42;
-              spawnTone(now, scale[baseIdx], 0.09, 0.052, panVal);
-              spawnTone(now + 0.115 + Math.random() * 0.03, scale[secondIdx], 0.13, 0.048, panVal);
+              spawnTone(now, scale[baseIdx], 0.09, 0.052, pos);
+              spawnTone(now + 0.115 + Math.random() * 0.03, scale[secondIdx], 0.13, 0.048, pos);
             } else {
               // Quiet 3-4 step data register check
               const count = 3 + Math.floor(Math.random() * 2);
               const baseIdx = Math.floor(Math.random() * 4);
-              const panVal = (Math.random() - 0.5) * 0.45;
               for (let i = 0; i < count; i += 1) {
                 const start = now + i * (0.072 + Math.random() * 0.015);
                 const freq = scale[(baseIdx + i) % scale.length];
-                spawnTone(start, freq, 0.065, 0.036, panVal);
+                spawnTone(start, freq, 0.065, 0.036, pos);
               }
             }
           } else if (roll < 0.8) {
             // Layer C: Muted machinery relay switching (single tick or latch/release pair)
-            const panVal = (Math.random() - 0.5) * 0.55;
+            const pos = sampleSystemsTransientPosition();
             const baseFreq = 430 + Math.random() * 280;
-            spawnRelayTick(now, baseFreq, 0.075, panVal);
+            spawnRelayTick(now, baseFreq, 0.075, pos);
             if (Math.random() < 0.58) {
               const releaseOffset = 0.068 + Math.random() * 0.045;
-              spawnRelayTick(now + releaseOffset, baseFreq + (Math.random() < 0.5 ? 110 : -85), 0.055, panVal);
+              spawnRelayTick(now + releaseOffset, baseFreq + (Math.random() < 0.5 ? 110 : -85), 0.055, pos);
             }
           } else {
             // Combined relay switch followed immediately by telemetry confirmation pulse
-            const panVal = (Math.random() - 0.5) * 0.4;
-            spawnRelayTick(now, 490 + Math.random() * 180, 0.065, panVal);
+            const pos = sampleSystemsTransientPosition();
+            spawnRelayTick(now, 490 + Math.random() * 180, 0.065, pos);
             const toneFreq = scale[Math.floor(Math.random() * scale.length)];
-            spawnTone(now + 0.085, toneFreq, 0.11, 0.045, panVal);
+            spawnTone(now + 0.085, toneFreq, 0.11, 0.045, pos);
           }
         }
       }
@@ -957,6 +1285,7 @@ export class DeepSpaceEngine {
         busNoiseGain.disconnect();
         busNoiseLfoGain.disconnect();
         activityGain.disconnect();
+        activityToneFilter.disconnect();
         busToneFilter.disconnect();
         disconnectBus();
       },
@@ -971,9 +1300,17 @@ export class DeepSpaceEngine {
    * D. Signal Interference & Loss (restrained narrowband RF interference & soft squelch cutoffs)
    */
   private buildCommunicationsChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
-    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
+    const {
+      input,
+      spatialInput,
+      eventBus,
+      outputGain,
+      analyser,
+      spatialProfile,
+      disconnectBus,
+    } = this.createChannelBus(ctx, dest, 'communications');
 
-    // Band-limit Communications to clean narrow receiver spectrum (no sub-mud, no harsh hiss)
+    // Band-limit continuous Communications standby bed to clean narrow receiver spectrum
     const commsHighpass = ctx.createBiquadFilter();
     commsHighpass.type = 'highpass';
     commsHighpass.frequency.value = 220;
@@ -986,10 +1323,23 @@ export class DeepSpaceEngine {
 
     commsHighpass.connect(commsLowpass).connect(input);
 
+    // Stereo-preserving band-limiting for 3D-spatialized transient transmissions
+    const activityHighpass = ctx.createBiquadFilter();
+    activityHighpass.type = 'highpass';
+    activityHighpass.frequency.value = 220;
+    activityHighpass.Q.value = 0.7;
+
+    const activityLowpass = ctx.createBiquadFilter();
+    activityLowpass.type = 'lowpass';
+    activityLowpass.frequency.value = 1650;
+    activityLowpass.Q.value = 0.7;
+
+    activityHighpass.connect(activityLowpass).connect(spatialInput);
+
     // Sub-gate for transient transmissions so disabling Communications fades cleanly without clicks
     const activityGain = ctx.createGain();
     activityGain.gain.value = 0;
-    activityGain.connect(commsHighpass);
+    activityGain.connect(activityHighpass);
 
     // --- Layer A: Receiver Standby (faint narrowband electronic texture, nearly silent) ---
     const standbyNoiseBuf = createSeamlessNoiseBuffer(ctx, 13.1, 'pink');
@@ -1046,7 +1396,7 @@ export class DeepSpaceEngine {
       centerFreq: number,
       duration: number,
       peakGain: number,
-      panVal: number,
+      trajectory: SpatialTrajectory,
       sweepDown = true,
     ) => {
       const src = ctx.createBufferSource();
@@ -1067,15 +1417,25 @@ export class DeepSpaceEngine {
       env.gain.linearRampToValueAtTime(peakGain, start + Math.min(0.04, duration * 0.25));
       env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
 
-      const pan = ctx.createStereoPanner();
-      pan.pan.value = panVal;
+      const spatial = createSpatialBus(ctx, activityGain, {
+        startPos: trajectory.start,
+        endPos: trajectory.end,
+        startTime: start,
+        durationSec: duration,
+        panningModel: 'HRTF',
+        refDistance: spatialProfile.refDistance,
+        maxDistance: spatialProfile.maxDistance,
+        rolloffFactor: spatialProfile.rolloffFactor,
+        distanceGain: spatialProfile.distanceGain,
+        airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 1850),
+      });
 
-      src.connect(bp).connect(env).connect(pan).connect(activityGain);
+      src.connect(bp).connect(env).connect(spatial.input);
       voices.track(src, () => {
         src.disconnect();
         bp.disconnect();
         env.disconnect();
-        pan.disconnect();
+        spatial.disconnect();
       });
       src.start(start, Math.random() * 9);
       src.stop(start + duration + 0.03);
@@ -1088,7 +1448,7 @@ export class DeepSpaceEngine {
       start: number,
       duration: number,
       peakGain: number,
-      panVal: number,
+      trajectory: SpatialTrajectory,
       abruptLoss: boolean,
     ) => {
       const startFreq = 440 + Math.random() * 560;
@@ -1126,23 +1486,33 @@ export class DeepSpaceEngine {
           startFreq + driftDelta,
           0.16,
           0.035,
-          panVal,
+          { start: trajectory.end, end: trajectory.end },
           true,
         );
       } else {
         env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
       }
 
-      const pan = ctx.createStereoPanner();
-      pan.pan.value = panVal;
+      const spatial = createSpatialBus(ctx, activityGain, {
+        startPos: trajectory.start,
+        endPos: trajectory.end,
+        startTime: start,
+        durationSec: duration,
+        panningModel: 'HRTF',
+        refDistance: spatialProfile.refDistance,
+        maxDistance: spatialProfile.maxDistance,
+        rolloffFactor: spatialProfile.rolloffFactor,
+        distanceGain: spatialProfile.distanceGain,
+        airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 1850),
+      });
 
-      osc.connect(bp).connect(env).connect(pan).connect(activityGain);
+      osc.connect(bp).connect(env).connect(spatial.input);
 
       voices.track(osc, () => {
         osc.disconnect();
         bp.disconnect();
         env.disconnect();
-        pan.disconnect();
+        spatial.disconnect();
       });
       voices.track(fmOsc, () => {
         fmOsc.disconnect();
@@ -1158,7 +1528,7 @@ export class DeepSpaceEngine {
     /**
      * Layer C: Fragmented narrow-interval FSK-style transmission cluster
      */
-    const spawnTransmissionFragment = (start: number, panVal: number) => {
+    const spawnTransmissionFragment = (start: number, trajectory: SpatialTrajectory) => {
       const baseFreq = 540 + Math.random() * 380;
       // Narrow related frequency ratios (avoiding musical scales or Morse regularity)
       const ratios = [1.0, 1.055, 1.125];
@@ -1168,9 +1538,20 @@ export class DeepSpaceEngine {
       bp.frequency.value = baseFreq * 1.06;
       bp.Q.value = 4.0;
 
-      const pan = ctx.createStereoPanner();
-      pan.pan.value = panVal;
-      bp.connect(pan).connect(activityGain);
+      const estDuration = count * 0.19;
+      const spatial = createSpatialBus(ctx, activityGain, {
+        startPos: trajectory.start,
+        endPos: trajectory.end,
+        startTime: start,
+        durationSec: estDuration,
+        panningModel: 'HRTF',
+        refDistance: spatialProfile.refDistance,
+        maxDistance: spatialProfile.maxDistance,
+        rolloffFactor: spatialProfile.rolloffFactor,
+        distanceGain: spatialProfile.distanceGain,
+        airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 1850),
+      });
+      bp.connect(spatial.input);
 
       let cursor = start;
       // Shape overall cluster fade so the fragment feels like a passing packet
@@ -1200,7 +1581,7 @@ export class DeepSpaceEngine {
           remaining -= 1;
           if (remaining <= 0) {
             bp.disconnect();
-            pan.disconnect();
+            spatial.disconnect();
           }
         });
         osc.start(cursor);
@@ -1212,7 +1593,14 @@ export class DeepSpaceEngine {
 
       // Occasional soft squelch tail as the fragment breaks apart
       if (Math.random() < 0.65) {
-        spawnSquelchOrInterference(lastEnd - 0.01, baseFreq * 1.08, 0.15, 0.03, panVal, true);
+        spawnSquelchOrInterference(
+          lastEnd - 0.01,
+          baseFreq * 1.08,
+          0.15,
+          0.03,
+          { start: trajectory.end, end: trajectory.end },
+          true,
+        );
       }
     };
 
@@ -1230,13 +1618,16 @@ export class DeepSpaceEngine {
       if (ctx.state === 'running') {
         const now = ctx.currentTime;
         cycleCount += 1;
-        const panVal = (Math.random() - 0.5) * 0.85;
 
         // Occasional longer drifting signal sequence (~every 7th cycle)
         if (cycleCount % 7 === 0) {
           const longDur = 3.2 + Math.random() * 1.4;
-          spawnCarrierAcquisition(now, longDur, 0.038, panVal, false);
-          spawnTransmissionFragment(now + 1.1, panVal * 0.85);
+          const trajectory = sampleCommunicationsTrajectory(true);
+          spawnCarrierAcquisition(now, longDur, 0.038, trajectory, false);
+          spawnTransmissionFragment(now + 1.1, {
+            start: trajectory.end,
+            end: trajectory.end,
+          });
           nextDelayMs = 6800 + Math.random() * 5200;
         } else {
           const roll = Math.random();
@@ -1245,16 +1636,19 @@ export class DeepSpaceEngine {
             // Faint carrier acquisition emerging and fading (or dropping with soft squelch)
             const dur = 1.4 + Math.random() * 1.8;
             const abrupt = Math.random() < 0.35;
-            spawnCarrierAcquisition(now, dur, 0.032 + Math.random() * 0.014, panVal, abrupt);
+            const trajectory = sampleCommunicationsTrajectory(Math.random() < 0.42);
+            spawnCarrierAcquisition(now, dur, 0.032 + Math.random() * 0.014, trajectory, abrupt);
             nextDelayMs = 3600 + Math.random() * 3800;
           } else if (roll < 0.62) {
             // Fragmented transmission cluster
-            spawnTransmissionFragment(now, panVal);
+            const trajectory = sampleCommunicationsTrajectory(Math.random() < 0.35);
+            spawnTransmissionFragment(now, trajectory);
             nextDelayMs = 4600 + Math.random() * 4400;
           } else if (roll < 0.78) {
             // Brief restrained narrowband RF interference burst
             const freq = 620 + Math.random() * 540;
-            spawnSquelchOrInterference(now, freq, 0.22 + Math.random() * 0.18, 0.034, panVal, false);
+            const trajectory = sampleCommunicationsTrajectory(false);
+            spawnSquelchOrInterference(now, freq, 0.22 + Math.random() * 0.18, 0.034, trajectory, false);
             nextDelayMs = 3800 + Math.random() * 4200;
           } else {
             // Intentional quiet listening gap — vast silent deep space between detections
@@ -1308,8 +1702,499 @@ export class DeepSpaceEngine {
         standbyDriftGain.disconnect();
         standbyBp.disconnect();
         activityGain.disconnect();
+        activityHighpass.disconnect();
+        activityLowpass.disconnect();
         commsHighpass.disconnect();
         commsLowpass.disconnect();
+        disconnectBus();
+      },
+    };
+  }
+
+  /**
+   * CH-06: Hull / Structural — Deep metallic resonance, distant creaks and structural stress
+   * A. Deep Structural Resonance (slowly shifting inharmonic metallic bulkhead modes, distinct from Reactor)
+   * B. Metallic Hull Creaks (infrequent, slowly flexing resonant metallic bends with soft attack & decay)
+   * C. Structural Stress Events (uncommon deeper metallic groans with layered resonances & spatial depth)
+   * D. Background Mechanical Texture (extremely subtle tonal structure ambience, zero broadband noise)
+   */
+  private buildHullChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
+    const {
+      input,
+      spatialInput,
+      eventBus,
+      outputGain,
+      analyser,
+      spatialProfile,
+      disconnectBus,
+    } = this.createChannelBus(ctx, dest, 'hull');
+
+    // Shape continuous structural bed to heavy, dark industrial metallic spectrum
+    const hullHighpass = ctx.createBiquadFilter();
+    hullHighpass.type = 'highpass';
+    hullHighpass.frequency.value = 28;
+    hullHighpass.Q.value = 0.7;
+
+    const hullLowpass = ctx.createBiquadFilter();
+    hullLowpass.type = 'lowpass';
+    hullLowpass.frequency.value = 640;
+    hullLowpass.Q.value = 0.65;
+
+    hullHighpass.connect(hullLowpass).connect(input);
+
+    // Stereo-preserving spectrum shaping for 360-degree spatialized hull creaks & stress groans
+    const activityHighpass = ctx.createBiquadFilter();
+    activityHighpass.type = 'highpass';
+    activityHighpass.frequency.value = 28;
+    activityHighpass.Q.value = 0.7;
+
+    const activityLowpass = ctx.createBiquadFilter();
+    activityLowpass.type = 'lowpass';
+    activityLowpass.frequency.value = 640;
+    activityLowpass.Q.value = 0.65;
+
+    activityHighpass.connect(activityLowpass).connect(spatialInput);
+
+    // Sub-gate for transient creaks and groans so disabling Hull fades smoothly without clicks
+    const activityGain = ctx.createGain();
+    activityGain.gain.value = 0;
+    activityGain.connect(activityHighpass);
+
+    // --- Layer A: Deep Structural Resonance (inharmonic steel modal frequencies) ---
+    const modalFilter = ctx.createBiquadFilter();
+    modalFilter.type = 'lowpass';
+    modalFilter.frequency.value = 155;
+    modalFilter.Q.value = 1.8;
+
+    const modalGain = ctx.createGain();
+    modalGain.gain.value = 0.14;
+    modalFilter.connect(modalGain).connect(hullHighpass);
+
+    // Inharmonic modal cluster (41.5 Hz, 67.2 Hz, 109.4 Hz) + slow beating pair (42.05 Hz)
+    const res1 = ctx.createOscillator();
+    res1.type = 'sine';
+    res1.frequency.value = 41.5;
+    const res1Gain = ctx.createGain();
+    res1Gain.gain.value = 0.42;
+    res1.connect(res1Gain).connect(modalFilter);
+
+    const res2 = ctx.createOscillator();
+    res2.type = 'sine';
+    res2.frequency.value = 42.05;
+    const res2Gain = ctx.createGain();
+    res2Gain.gain.value = 0.24;
+    res2.connect(res2Gain).connect(modalFilter);
+
+    const res3 = ctx.createOscillator();
+    res3.type = 'sine';
+    res3.frequency.value = 67.2;
+    const res3Gain = ctx.createGain();
+    res3Gain.gain.value = 0.22;
+    res3.connect(res3Gain).connect(modalFilter);
+
+    const res4 = ctx.createOscillator();
+    res4.type = 'triangle';
+    res4.frequency.value = 109.4;
+    const res4Gain = ctx.createGain();
+    res4Gain.gain.value = 0.12;
+    res4.connect(res4Gain).connect(modalFilter);
+
+    // Slow incommensurate LFOs for thermal/mechanical bulkhead breathing
+    const modalCutoffLfo = ctx.createOscillator();
+    modalCutoffLfo.type = 'sine';
+    modalCutoffLfo.frequency.value = 0.031;
+    const modalCutoffLfoGain = ctx.createGain();
+    modalCutoffLfoGain.gain.value = 34;
+    modalCutoffLfo.connect(modalCutoffLfoGain).connect(modalFilter.frequency);
+
+    const modalPitchLfo = ctx.createOscillator();
+    modalPitchLfo.type = 'sine';
+    modalPitchLfo.frequency.value = 0.023;
+    const modalPitchLfoGain = ctx.createGain();
+    modalPitchLfoGain.gain.value = 0.45;
+    modalPitchLfo.connect(modalPitchLfoGain).connect(res3.frequency);
+
+    const modalAmpLfo = ctx.createOscillator();
+    modalAmpLfo.type = 'sine';
+    modalAmpLfo.frequency.value = 0.037;
+    const modalAmpLfoGain = ctx.createGain();
+    modalAmpLfoGain.gain.value = 0.032;
+    modalAmpLfo.connect(modalAmpLfoGain).connect(modalGain.gain);
+
+    // --- Layer D: Background Mechanical Texture (extremely subtle tonal structure, no broadband noise) ---
+    const texFilter = ctx.createBiquadFilter();
+    texFilter.type = 'bandpass';
+    texFilter.frequency.value = 178;
+    texFilter.Q.value = 3.2;
+
+    const texGain = ctx.createGain();
+    texGain.gain.value = 0.018;
+    texFilter.connect(texGain).connect(hullHighpass);
+
+    const texOsc1 = ctx.createOscillator();
+    texOsc1.type = 'sine';
+    texOsc1.frequency.value = 138;
+    const texOsc1Gain = ctx.createGain();
+    texOsc1Gain.gain.value = 0.55;
+    texOsc1.connect(texOsc1Gain).connect(texFilter);
+
+    const texOsc2 = ctx.createOscillator();
+    texOsc2.type = 'triangle';
+    texOsc2.frequency.value = 214;
+    const texOsc2Gain = ctx.createGain();
+    texOsc2Gain.gain.value = 0.35;
+    texOsc2.connect(texOsc2Gain).connect(texFilter);
+
+    const texDriftLfo = ctx.createOscillator();
+    texDriftLfo.type = 'sine';
+    texDriftLfo.frequency.value = 0.041;
+    const texDriftLfoGain = ctx.createGain();
+    texDriftLfoGain.gain.value = 22;
+    texDriftLfo.connect(texDriftLfoGain).connect(texFilter.frequency);
+
+    res1.start();
+    res2.start();
+    res3.start();
+    res4.start();
+    modalCutoffLfo.start();
+    modalPitchLfo.start();
+    modalAmpLfo.start();
+    texOsc1.start();
+    texOsc2.start();
+    texDriftLfo.start();
+
+    const voices = new TransientVoicePool();
+    let timerId: number | null = null;
+    let running = false;
+    let cycleCount = 0;
+
+    const clearTimer = () => {
+      if (timerId !== null) {
+        window.clearTimeout(timerId);
+        timerId = null;
+      }
+    };
+
+    /**
+     * Layer B: Infrequent, slowly developing metallic hull creak (resonant flex, soft attack & decay)
+     */
+    const spawnHullCreak = (start: number, trajectory: SpatialTrajectory) => {
+      const duration = 2.1 + Math.random() * 1.5;
+      const baseFreq = 112 + Math.random() * 58;
+      const bendDelta = (Math.random() < 0.5 ? -1 : 1) * (4.5 + Math.random() * 5.5);
+
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(baseFreq * 1.18, start);
+      bp.frequency.linearRampToValueAtTime(baseFreq * 1.32, start + duration * 0.5);
+      bp.frequency.linearRampToValueAtTime(baseFreq * 1.12, start + duration);
+      bp.Q.value = 3.4;
+
+      const env = ctx.createGain();
+      const peakGain = 0.036 + Math.random() * 0.018;
+      const attack = duration * (0.36 + Math.random() * 0.12);
+      env.gain.setValueAtTime(0.0001, start);
+      env.gain.linearRampToValueAtTime(peakGain, start + attack);
+      env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+      const spatial = createSpatialBus(ctx, activityGain, {
+        startPos: trajectory.start,
+        endPos: trajectory.end,
+        startTime: start,
+        durationSec: duration,
+        panningModel: 'HRTF',
+        refDistance: spatialProfile.refDistance,
+        maxDistance: spatialProfile.maxDistance,
+        rolloffFactor: spatialProfile.rolloffFactor,
+        distanceGain: spatialProfile.distanceGain,
+        airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 1100),
+      });
+
+      const osc1 = ctx.createOscillator();
+      osc1.type = 'triangle';
+      osc1.frequency.setValueAtTime(baseFreq, start);
+      osc1.frequency.linearRampToValueAtTime(baseFreq + bendDelta, start + duration);
+
+      // Inharmonic metallic partial (ratio ~1.61)
+      const osc2 = ctx.createOscillator();
+      osc2.type = 'sine';
+      osc2.frequency.setValueAtTime(baseFreq * 1.61, start);
+      osc2.frequency.linearRampToValueAtTime(baseFreq * 1.61 + bendDelta * 1.35, start + duration);
+
+      // Subtle slow structural grain FM (low frequency, low depth — cold steel flex, not squeal)
+      const grainOsc = ctx.createOscillator();
+      grainOsc.type = 'sine';
+      grainOsc.frequency.value = 14 + Math.random() * 9;
+      const grainGain = ctx.createGain();
+      grainGain.gain.value = 2.8 + Math.random() * 2.2;
+      grainOsc.connect(grainGain).connect(osc1.frequency);
+
+      const g2 = ctx.createGain();
+      g2.gain.value = 0.65;
+
+      osc1.connect(bp);
+      osc2.connect(g2).connect(bp);
+      bp.connect(env).connect(spatial.input);
+
+      let remaining = 3;
+      const maybeDisconnectBus = () => {
+        remaining -= 1;
+        if (remaining <= 0) {
+          bp.disconnect();
+          env.disconnect();
+          spatial.disconnect();
+        }
+      };
+
+      voices.track(osc1, () => {
+        osc1.disconnect();
+        maybeDisconnectBus();
+      });
+      voices.track(osc2, () => {
+        osc2.disconnect();
+        g2.disconnect();
+        maybeDisconnectBus();
+      });
+      voices.track(grainOsc, () => {
+        grainOsc.disconnect();
+        grainGain.disconnect();
+        maybeDisconnectBus();
+      });
+
+      osc1.start(start);
+      osc2.start(start);
+      grainOsc.start(start);
+      osc1.stop(start + duration + 0.04);
+      osc2.stop(start + duration + 0.04);
+      grainOsc.stop(start + duration + 0.04);
+    };
+
+    /**
+     * Layer C: Uncommon deeper metallic structural stress groan with diffuse spatial echo
+     */
+    const spawnStructuralStressGroan = (start: number, trajectory: SpatialTrajectory) => {
+      const duration = 3.6 + Math.random() * 1.8;
+      const rootFreq = 54 + Math.random() * 24;
+      const bend = -1.6 - Math.random() * 2.4;
+
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(160, start);
+      lp.frequency.linearRampToValueAtTime(265, start + duration * 0.42);
+      lp.frequency.linearRampToValueAtTime(145, start + duration);
+      lp.Q.value = 2.2;
+
+      const env = ctx.createGain();
+      const peakGain = 0.055 + Math.random() * 0.022;
+      env.gain.setValueAtTime(0.0001, start);
+      env.gain.linearRampToValueAtTime(peakGain, start + duration * 0.34);
+      env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+      const spatial = createSpatialBus(ctx, activityGain, {
+        startPos: trajectory.start,
+        endPos: trajectory.end,
+        startTime: start,
+        durationSec: duration,
+        panningModel: 'HRTF',
+        refDistance: spatialProfile.refDistance,
+        maxDistance: spatialProfile.maxDistance,
+        rolloffFactor: spatialProfile.rolloffFactor,
+        distanceGain: spatialProfile.distanceGain,
+        airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 960),
+      });
+
+      // Three heavy inharmonic steel modes (1.0, 1.59, 2.54)
+      const m1 = ctx.createOscillator();
+      m1.type = 'sine';
+      m1.frequency.setValueAtTime(rootFreq, start);
+      m1.frequency.linearRampToValueAtTime(rootFreq + bend, start + duration);
+
+      const m2 = ctx.createOscillator();
+      m2.type = 'triangle';
+      m2.frequency.setValueAtTime(rootFreq * 1.59, start);
+      m2.frequency.linearRampToValueAtTime(rootFreq * 1.59 + bend * 1.4, start + duration);
+
+      const m3 = ctx.createOscillator();
+      m3.type = 'sine';
+      m3.frequency.setValueAtTime(rootFreq * 2.54, start);
+      m3.frequency.linearRampToValueAtTime(rootFreq * 2.54 + bend * 1.9, start + duration);
+
+      // Distant spatial echo reflection across opposite spacecraft bulkhead
+      const echo = ctx.createOscillator();
+      echo.type = 'sine';
+      echo.frequency.setValueAtTime(rootFreq * 1.59, start + 0.45);
+      echo.frequency.linearRampToValueAtTime(rootFreq * 1.59 + bend, start + duration + 0.4);
+      const echoEnv = ctx.createGain();
+      echoEnv.gain.setValueAtTime(0.0001, start + 0.45);
+      echoEnv.gain.linearRampToValueAtTime(peakGain * 0.38, start + 0.45 + duration * 0.35);
+      echoEnv.gain.exponentialRampToValueAtTime(0.0001, start + duration + 0.45);
+      const echoPos: SpatialVec3 = {
+        x: -trajectory.end.x * 0.85,
+        y: trajectory.end.y * 0.7,
+        z: -trajectory.end.z * 0.85,
+      };
+      const echoSpatial = createSpatialBus(ctx, activityGain, {
+        startPos: echoPos,
+        startTime: start + 0.45,
+        panningModel: 'HRTF',
+        refDistance: spatialProfile.refDistance,
+        maxDistance: spatialProfile.maxDistance,
+        rolloffFactor: spatialProfile.rolloffFactor,
+        distanceGain: spatialProfile.distanceGain,
+        airAbsorptionHz: computeDistanceLowpassHz(echoPos, 850),
+      });
+
+      const g2 = ctx.createGain();
+      g2.gain.value = 0.45;
+      const g3 = ctx.createGain();
+      g3.gain.value = 0.25;
+
+      m1.connect(lp);
+      m2.connect(g2).connect(lp);
+      m3.connect(g3).connect(lp);
+      lp.connect(env).connect(spatial.input);
+      echo.connect(echoEnv).connect(echoSpatial.input);
+
+      let remaining = 4;
+      const maybeDisconnectBus = () => {
+        remaining -= 1;
+        if (remaining <= 0) {
+          lp.disconnect();
+          env.disconnect();
+          spatial.disconnect();
+          echoEnv.disconnect();
+          echoSpatial.disconnect();
+        }
+      };
+
+      voices.track(m1, () => {
+        m1.disconnect();
+        maybeDisconnectBus();
+      });
+      voices.track(m2, () => {
+        m2.disconnect();
+        g2.disconnect();
+        maybeDisconnectBus();
+      });
+      voices.track(m3, () => {
+        m3.disconnect();
+        g3.disconnect();
+        maybeDisconnectBus();
+      });
+      voices.track(echo, () => {
+        echo.disconnect();
+        maybeDisconnectBus();
+      });
+
+      m1.start(start);
+      m2.start(start);
+      m3.start(start);
+      echo.start(start + 0.45);
+      m1.stop(start + duration + 0.04);
+      m2.stop(start + duration + 0.04);
+      m3.stop(start + duration + 0.04);
+      echo.stop(start + duration + 0.48);
+    };
+
+    const scheduleHullActivity = () => {
+      if (!running || this.disposed || this.ctx !== ctx) return;
+
+      if (typeof document !== 'undefined' && document.hidden) {
+        timerId = null;
+        return;
+      }
+
+      let nextDelayMs = 8500 + Math.random() * 11000;
+
+      if (ctx.state === 'running') {
+        const now = ctx.currentTime;
+        cycleCount += 1;
+        const roll = Math.random();
+
+        if (cycleCount % 4 === 0 || roll < 0.25) {
+          // Uncommon deeper structural stress groan
+          spawnStructuralStressGroan(now, sampleHullSurroundingTrajectory(Math.random() < 0.35));
+          nextDelayMs = 13_500 + Math.random() * 14_500;
+        } else if (roll < 0.68) {
+          // Infrequent resonant hull flex / creak
+          spawnHullCreak(now, sampleHullSurroundingTrajectory(Math.random() < 0.32));
+          nextDelayMs = 9_500 + Math.random() * 12_500;
+        } else {
+          // Quiet structural rest interval so sounds never feel repetitive
+          nextDelayMs = 11_000 + Math.random() * 13_000;
+        }
+      }
+
+      timerId = window.setTimeout(scheduleHullActivity, nextDelayMs);
+    };
+
+    const start = () => {
+      if (running && timerId !== null) return;
+      running = true;
+      smoothSetParam(activityGain.gain, 1, ctx.currentTime, 0.06);
+      clearTimer();
+      timerId = window.setTimeout(scheduleHullActivity, 2400 + Math.random() * 2600);
+    };
+
+    const stop = () => {
+      if (!running && timerId === null) return;
+      running = false;
+      clearTimer();
+      const now = ctx.currentTime;
+      activityGain.gain.cancelScheduledValues(now);
+      activityGain.gain.setValueAtTime(activityGain.gain.value, now);
+      activityGain.gain.linearRampToValueAtTime(0, now + 0.03);
+      voices.stopAll(now, ctx.state !== 'running');
+    };
+
+    return {
+      gain: outputGain,
+      eventBus,
+      analyser,
+      start,
+      stop,
+      cleanup: () => {
+        running = false;
+        clearTimer();
+        voices.stopAll(ctx.currentTime, true);
+        for (const src of [
+          res1,
+          res2,
+          res3,
+          res4,
+          modalCutoffLfo,
+          modalPitchLfo,
+          modalAmpLfo,
+          texOsc1,
+          texOsc2,
+          texDriftLfo,
+        ]) {
+          try {
+            src.stop();
+          } catch {
+            // Ignore already stopped
+          }
+          src.disconnect();
+        }
+        res1Gain.disconnect();
+        res2Gain.disconnect();
+        res3Gain.disconnect();
+        res4Gain.disconnect();
+        modalCutoffLfoGain.disconnect();
+        modalPitchLfoGain.disconnect();
+        modalAmpLfoGain.disconnect();
+        modalFilter.disconnect();
+        modalGain.disconnect();
+        texOsc1Gain.disconnect();
+        texOsc2Gain.disconnect();
+        texDriftLfoGain.disconnect();
+        texFilter.disconnect();
+        texGain.disconnect();
+        activityGain.disconnect();
+        activityHighpass.disconnect();
+        activityLowpass.disconnect();
+        hullHighpass.disconnect();
+        hullLowpass.disconnect();
         disconnectBus();
       },
     };
@@ -1361,6 +2246,12 @@ export class DeepSpaceEngine {
         this.channels.communications?.stop?.();
       }
 
+      if (state.channels.hull.enabled) {
+        this.channels.hull?.start?.();
+      } else {
+        this.channels.hull?.stop?.();
+      }
+
       // Optional Ambient Event System synchronization
       if (!state.ambientEventsEnabled) {
         this.stopAmbientEvents(true);
@@ -1379,6 +2270,7 @@ export class DeepSpaceEngine {
       this.stopAmbientEvents(true);
       this.channels.systems?.stop?.();
       this.channels.communications?.stop?.();
+      this.channels.hull?.stop?.();
 
       if (this.masterGain) {
         this.masterGain.gain.cancelScheduledValues(now);
@@ -1531,7 +2423,11 @@ export class DeepSpaceEngine {
       case 'system-diagnostic':
         return this.triggerSystemDiagnostic(ctx, node.eventBus, now);
       case 'sensor-anomaly':
-        return this.triggerSensorAnomaly(ctx, node.eventBus, now);
+        return this.triggerSensorAnomaly(ctx, node.eventBus, now, targetChannel);
+      case 'structural-resonance':
+        return this.triggerStructuralResonance(ctx, node.eventBus, now);
+      case 'hull-stress':
+        return this.triggerHullStress(ctx, node.eventBus, now);
     }
   }
 
@@ -1540,6 +2436,16 @@ export class DeepSpaceEngine {
    */
   private triggerReactorFluctuation(ctx: AudioContext, dest: AudioNode, start: number): number {
     const duration = 3.2;
+    const profile = CHANNEL_SPATIAL_PROFILES.reactor;
+    const spatial = createSpatialBus(ctx, dest, {
+      startPos: profile.position,
+      startTime: start,
+      panningModel: profile.panningModel,
+      refDistance: profile.refDistance,
+      maxDistance: profile.maxDistance,
+      rolloffFactor: profile.rolloffFactor,
+      distanceGain: profile.distanceGain,
+    });
 
     const lp = ctx.createBiquadFilter();
     lp.type = 'lowpass';
@@ -1577,12 +2483,13 @@ export class DeepSpaceEngine {
 
     oscA.connect(lp);
     oscB.connect(gB).connect(lp);
-    lp.connect(env).connect(dest);
+    lp.connect(env).connect(spatial.input);
 
     this.eventVoices.track(oscA, () => {
       oscA.disconnect();
       lp.disconnect();
       env.disconnect();
+      spatial.disconnect();
     });
     this.eventVoices.track(oscB, () => {
       oscB.disconnect();
@@ -1608,7 +2515,8 @@ export class DeepSpaceEngine {
    */
   private triggerNavigationBeacon(ctx: AudioContext, dest: AudioNode, start: number): number {
     const carrierBase = 880 + Math.random() * 240;
-    const panVal = (Math.random() - 0.5) * 0.65;
+    const profile = CHANNEL_SPATIAL_PROFILES.communications;
+    const trajectory = sampleCommunicationsTrajectory(false);
     const pulses = [
       { offset: 0, dur: 0.22, freq: carrierBase },
       { offset: 0.42, dur: 0.22, freq: carrierBase },
@@ -1620,9 +2528,17 @@ export class DeepSpaceEngine {
     bp.frequency.value = carrierBase * 1.04;
     bp.Q.value = 5.5;
 
-    const pan = ctx.createStereoPanner();
-    pan.pan.value = panVal;
-    bp.connect(pan).connect(dest);
+    const spatial = createSpatialBus(ctx, dest, {
+      startPos: trajectory.start,
+      startTime: start,
+      panningModel: 'HRTF',
+      refDistance: profile.refDistance,
+      maxDistance: profile.maxDistance,
+      rolloffFactor: profile.rolloffFactor,
+      distanceGain: profile.distanceGain,
+      airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 1950),
+    });
+    bp.connect(spatial.input);
 
     let remaining = pulses.length;
     for (const p of pulses) {
@@ -1643,7 +2559,7 @@ export class DeepSpaceEngine {
         remaining -= 1;
         if (remaining <= 0) {
           bp.disconnect();
-          pan.disconnect();
+          spatial.disconnect();
         }
       });
 
@@ -1660,7 +2576,8 @@ export class DeepSpaceEngine {
   private triggerCommsInterference(ctx: AudioContext, dest: AudioNode, start: number): number {
     const duration = 1.65;
     const centerFreq = 640 + Math.random() * 320;
-    const panVal = (Math.random() - 0.5) * 0.7;
+    const profile = CHANNEL_SPATIAL_PROFILES.communications;
+    const trajectory = sampleCommunicationsTrajectory(Math.random() < 0.45);
 
     const noiseSrc = ctx.createBufferSource();
     noiseSrc.buffer = this.getEventNoiseBuffer(ctx);
@@ -1695,21 +2612,40 @@ export class DeepSpaceEngine {
     carrierEnv.gain.linearRampToValueAtTime(0.022, start + 0.18);
     carrierEnv.gain.exponentialRampToValueAtTime(0.0001, start + duration * 0.85);
 
-    const pan = ctx.createStereoPanner();
-    pan.pan.value = panVal;
+    const spatial = createSpatialBus(ctx, dest, {
+      startPos: trajectory.start,
+      endPos: trajectory.end,
+      startTime: start,
+      durationSec: duration,
+      panningModel: 'HRTF',
+      refDistance: profile.refDistance,
+      maxDistance: profile.maxDistance,
+      rolloffFactor: profile.rolloffFactor,
+      distanceGain: profile.distanceGain,
+      airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 1850),
+    });
 
-    noiseSrc.connect(bp).connect(noiseEnv).connect(pan).connect(dest);
-    carrier.connect(carrierEnv).connect(pan);
+    noiseSrc.connect(bp).connect(noiseEnv).connect(spatial.input);
+    carrier.connect(carrierEnv).connect(spatial.input);
+
+    let remaining = 2;
+    const maybeReleaseSpatial = () => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        spatial.disconnect();
+      }
+    };
 
     this.eventVoices.track(noiseSrc, () => {
       noiseSrc.disconnect();
       bp.disconnect();
       noiseEnv.disconnect();
-      pan.disconnect();
+      maybeReleaseSpatial();
     });
     this.eventVoices.track(carrier, () => {
       carrier.disconnect();
       carrierEnv.disconnect();
+      maybeReleaseSpatial();
     });
     this.eventVoices.track(flutter, () => {
       flutter.disconnect();
@@ -1732,16 +2668,24 @@ export class DeepSpaceEngine {
   private triggerSystemDiagnostic(ctx: AudioContext, dest: AudioNode, start: number): number {
     const notes = [392.0, 493.88, 587.33, 440.0];
     const stepSec = 0.165;
-    const panVal = (Math.random() - 0.5) * 0.3;
+    const profile = CHANNEL_SPATIAL_PROFILES.systems;
+    const pos = sampleSystemsTransientPosition();
 
     const lp = ctx.createBiquadFilter();
     lp.type = 'lowpass';
     lp.frequency.value = 1320;
     lp.Q.value = 0.7;
 
-    const pan = ctx.createStereoPanner();
-    pan.pan.value = panVal;
-    lp.connect(pan).connect(dest);
+    const spatial = createSpatialBus(ctx, dest, {
+      startPos: pos,
+      startTime: start,
+      panningModel: 'HRTF',
+      refDistance: profile.refDistance,
+      maxDistance: profile.maxDistance,
+      rolloffFactor: profile.rolloffFactor,
+      distanceGain: profile.distanceGain,
+    });
+    lp.connect(spatial.input);
 
     let remaining = notes.length;
     notes.forEach((freq, idx) => {
@@ -1766,7 +2710,7 @@ export class DeepSpaceEngine {
         remaining -= 1;
         if (remaining <= 0) {
           lp.disconnect();
-          pan.disconnect();
+          spatial.disconnect();
         }
       });
 
@@ -1780,19 +2724,44 @@ export class DeepSpaceEngine {
   /**
    * Event 5: Sensor Anomaly — faint, unusual beating pulse & subtle echo on Systems or Comms
    */
-  private triggerSensorAnomaly(ctx: AudioContext, dest: AudioNode, start: number): number {
+  private triggerSensorAnomaly(
+    ctx: AudioContext,
+    dest: AudioNode,
+    start: number,
+    targetChannel: ChannelId,
+  ): number {
     const duration = 2.6;
     const baseFreq = 685 + Math.random() * 140;
-    const panVal = (Math.random() - 0.5) * 0.5;
+    const profile = CHANNEL_SPATIAL_PROFILES[targetChannel];
+    const trajectory: SpatialTrajectory =
+      targetChannel === 'communications'
+        ? sampleCommunicationsTrajectory(Math.random() < 0.45)
+        : (() => {
+            const p = sampleSystemsTransientPosition();
+            return { start: p, end: p };
+          })();
 
     const bp = ctx.createBiquadFilter();
     bp.type = 'bandpass';
     bp.frequency.value = baseFreq;
     bp.Q.value = 4.6;
 
-    const pan = ctx.createStereoPanner();
-    pan.pan.value = panVal;
-    bp.connect(pan).connect(dest);
+    const spatial = createSpatialBus(ctx, dest, {
+      startPos: trajectory.start,
+      endPos: trajectory.end,
+      startTime: start,
+      durationSec: duration,
+      panningModel: 'HRTF',
+      refDistance: profile.refDistance,
+      maxDistance: profile.maxDistance,
+      rolloffFactor: profile.rolloffFactor,
+      distanceGain: profile.distanceGain,
+      airAbsorptionHz:
+        targetChannel === 'communications'
+          ? computeDistanceLowpassHz(trajectory.start, 1950)
+          : null,
+    });
+    bp.connect(spatial.input);
 
     const osc1 = ctx.createOscillator();
     osc1.type = 'sine';
@@ -1822,7 +2791,7 @@ export class DeepSpaceEngine {
       remaining -= 1;
       if (remaining <= 0) {
         bp.disconnect();
-        pan.disconnect();
+        spatial.disconnect();
       }
     };
 
@@ -1856,6 +2825,177 @@ export class DeepSpaceEngine {
   }
 
   /**
+   * Event 6: Structural Resonance — slow, deep metallic bulkhead resonance swell on Hull
+   */
+  private triggerStructuralResonance(ctx: AudioContext, dest: AudioNode, start: number): number {
+    const duration = 4.4;
+    const baseFreq = 62 + Math.random() * 14;
+    const profile = CHANNEL_SPATIAL_PROFILES.hull;
+    const trajectory = sampleHullSurroundingTrajectory(false);
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(baseFreq * 1.7, start);
+    bp.frequency.linearRampToValueAtTime(baseFreq * 2.45, start + 1.7);
+    bp.frequency.linearRampToValueAtTime(baseFreq * 1.65, start + duration);
+    bp.Q.value = 2.6;
+
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0.0001, start);
+    env.gain.linearRampToValueAtTime(0.075, start + 1.6);
+    env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+    const spatial = createSpatialBus(ctx, dest, {
+      startPos: trajectory.start,
+      startTime: start,
+      panningModel: 'HRTF',
+      refDistance: profile.refDistance,
+      maxDistance: profile.maxDistance,
+      rolloffFactor: profile.rolloffFactor,
+      distanceGain: profile.distanceGain,
+      airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 1050),
+    });
+
+    const osc1 = ctx.createOscillator();
+    osc1.type = 'sine';
+    osc1.frequency.setValueAtTime(baseFreq, start);
+    osc1.frequency.linearRampToValueAtTime(baseFreq + 1.4, start + duration);
+
+    const osc2 = ctx.createOscillator();
+    osc2.type = 'triangle';
+    osc2.frequency.setValueAtTime(baseFreq * 1.615, start);
+    osc2.frequency.linearRampToValueAtTime(baseFreq * 1.615 + 1.8, start + duration);
+
+    const g2 = ctx.createGain();
+    g2.gain.value = 0.42;
+
+    osc1.connect(bp);
+    osc2.connect(g2).connect(bp);
+    bp.connect(env).connect(spatial.input);
+
+    let remaining = 2;
+    const maybeCleanup = () => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        bp.disconnect();
+        env.disconnect();
+        spatial.disconnect();
+      }
+    };
+
+    this.eventVoices.track(osc1, () => {
+      osc1.disconnect();
+      maybeCleanup();
+    });
+    this.eventVoices.track(osc2, () => {
+      osc2.disconnect();
+      g2.disconnect();
+      maybeCleanup();
+    });
+
+    osc1.start(start);
+    osc2.start(start);
+    osc1.stop(start + duration + 0.04);
+    osc2.stop(start + duration + 0.04);
+
+    return duration;
+  }
+
+  /**
+   * Event 7: Hull Stress — subtle, layered metallic groan with long decay on Hull
+   */
+  private triggerHullStress(ctx: AudioContext, dest: AudioNode, start: number): number {
+    const duration = 5.0;
+    const rootFreq = 49 + Math.random() * 14;
+    const profile = CHANNEL_SPATIAL_PROFILES.hull;
+    const trajectory = sampleHullSurroundingTrajectory(Math.random() < 0.35);
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(140, start);
+    lp.frequency.linearRampToValueAtTime(240, start + 1.5);
+    lp.frequency.linearRampToValueAtTime(125, start + duration);
+    lp.Q.value = 2.0;
+
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0.0001, start);
+    env.gain.linearRampToValueAtTime(0.085, start + 1.35);
+    env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+    const spatial = createSpatialBus(ctx, dest, {
+      startPos: trajectory.start,
+      endPos: trajectory.end,
+      startTime: start,
+      durationSec: duration,
+      panningModel: 'HRTF',
+      refDistance: profile.refDistance,
+      maxDistance: profile.maxDistance,
+      rolloffFactor: profile.rolloffFactor,
+      distanceGain: profile.distanceGain,
+      airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 960),
+    });
+
+    const m1 = ctx.createOscillator();
+    m1.type = 'sine';
+    m1.frequency.setValueAtTime(rootFreq, start);
+    m1.frequency.linearRampToValueAtTime(rootFreq - 2.1, start + duration);
+
+    const m2 = ctx.createOscillator();
+    m2.type = 'triangle';
+    m2.frequency.setValueAtTime(rootFreq * 1.58, start);
+    m2.frequency.linearRampToValueAtTime(rootFreq * 1.58 - 2.8, start + duration);
+
+    const m3 = ctx.createOscillator();
+    m3.type = 'sine';
+    m3.frequency.setValueAtTime(rootFreq * 2.52, start);
+    m3.frequency.linearRampToValueAtTime(rootFreq * 2.52 - 3.6, start + duration);
+
+    const g2 = ctx.createGain();
+    g2.gain.value = 0.45;
+    const g3 = ctx.createGain();
+    g3.gain.value = 0.25;
+
+    m1.connect(lp);
+    m2.connect(g2).connect(lp);
+    m3.connect(g3).connect(lp);
+    lp.connect(env).connect(spatial.input);
+
+    let remaining = 3;
+    const maybeCleanup = () => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        lp.disconnect();
+        env.disconnect();
+        spatial.disconnect();
+      }
+    };
+
+    this.eventVoices.track(m1, () => {
+      m1.disconnect();
+      maybeCleanup();
+    });
+    this.eventVoices.track(m2, () => {
+      m2.disconnect();
+      g2.disconnect();
+      maybeCleanup();
+    });
+    this.eventVoices.track(m3, () => {
+      m3.disconnect();
+      g3.disconnect();
+      maybeCleanup();
+    });
+
+    m1.start(start);
+    m2.start(start);
+    m3.start(start);
+    m1.stop(start + duration + 0.04);
+    m2.stop(start + duration + 0.04);
+    m3.stop(start + duration + 0.04);
+
+    return duration;
+  }
+
+  /**
    * Returns normalized [0..1] live RMS signal level per channel for subtle
    * visual indicator bars without allocating arrays per frame.
    */
@@ -1866,6 +3006,7 @@ export class DeepSpaceEngine {
       ventilation: 0,
       systems: 0,
       communications: 0,
+      hull: 0,
     };
 
     if (!this.ctx || !state.isActive || this.ctx.state !== 'running') {

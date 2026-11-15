@@ -12,6 +12,7 @@ import {
 import { ChannelStrip } from './components/ChannelStrip';
 import { MasterControls } from './components/MasterControls';
 import { PresetSelector } from './components/PresetSelector';
+import { ShipTelemetry } from './components/ShipTelemetry';
 
 export default function App() {
   const [state, dispatch] = useReducer(mixerReducer, undefined, createInitialMixerState);
@@ -26,6 +27,16 @@ export default function App() {
     ventilation: createRef<HTMLDivElement | null>(),
     systems: createRef<HTMLDivElement | null>(),
     communications: createRef<HTMLDivElement | null>(),
+    hull: createRef<HTMLDivElement | null>(),
+  });
+
+  const telemetryMeterRefs = useRef<Record<ChannelId, React.RefObject<HTMLDivElement | null>>>({
+    reactor: createRef<HTMLDivElement | null>(),
+    engines: createRef<HTMLDivElement | null>(),
+    ventilation: createRef<HTMLDivElement | null>(),
+    systems: createRef<HTMLDivElement | null>(),
+    communications: createRef<HTMLDivElement | null>(),
+    hull: createRef<HTMLDivElement | null>(),
   });
 
   // Lazily create engine and dispose on unmount
@@ -68,16 +79,25 @@ export default function App() {
         if (el) {
           el.style.transform = 'scaleX(0)';
         }
+        const telEl = telemetryMeterRefs.current[ch.id].current;
+        if (telEl) {
+          telEl.style.transform = 'scaleX(0)';
+        }
       }
       return;
     }
 
     if (prefersReducedMotion) {
       for (const ch of CHANNELS) {
+        const active = state.channels[ch.id].enabled;
+        const val = `scaleX(${active ? Math.max(0.15, state.channels[ch.id].volume) : 0})`;
         const el = meterRefs.current[ch.id].current;
         if (el) {
-          const active = state.channels[ch.id].enabled;
-          el.style.transform = `scaleX(${active ? Math.max(0.15, state.channels[ch.id].volume) : 0})`;
+          el.style.transform = val;
+        }
+        const telEl = telemetryMeterRefs.current[ch.id].current;
+        if (telEl) {
+          telEl.style.transform = val;
         }
       }
       return;
@@ -90,10 +110,16 @@ export default function App() {
       if (engine && current.isActive && !document.hidden) {
         const levels = engine.getChannelLevels(current);
         for (const ch of CHANNELS) {
-          const el = meterRefs.current[ch.id].current;
-          if (!el) continue;
           const level = current.channels[ch.id].enabled ? Math.max(0.08, levels[ch.id]) : 0;
-          el.style.transform = `scaleX(${level.toFixed(3)})`;
+          const transform = `scaleX(${level.toFixed(3)})`;
+          const el = meterRefs.current[ch.id].current;
+          if (el) {
+            el.style.transform = transform;
+          }
+          const telEl = telemetryMeterRefs.current[ch.id].current;
+          if (telEl) {
+            telEl.style.transform = transform;
+          }
         }
       }
       if (!document.hidden) {
@@ -192,6 +218,15 @@ export default function App() {
             </span>
           </div>
         </header>
+
+        {/* Ship Telemetry Dashboard */}
+        <div className="mb-3">
+          <ShipTelemetry
+            state={state}
+            lastAmbientEvent={lastAmbientEvent}
+            telemetryMeterRefs={telemetryMeterRefs.current}
+          />
+        </div>
 
         {/* Master Controls */}
         <div className="mb-3">

@@ -3,7 +3,8 @@ export type ChannelId =
   | 'engines'
   | 'ventilation'
   | 'systems'
-  | 'communications';
+  | 'communications'
+  | 'hull';
 
 export type PresetId =
   | 'deep-transit'
@@ -77,6 +78,13 @@ export const CHANNELS: readonly ChannelMeta[] = [
     description: 'Subtle subspace static and distant signal drift',
     defaultVolume: 0.3,
   },
+  {
+    id: 'hull',
+    code: 'CH-06',
+    name: 'Hull / Structural',
+    description: 'Deep metallic resonance, distant creaks and structural stress',
+    defaultVolume: 0.25,
+  },
 ] as const;
 
 export const ENVIRONMENT_PRESETS: readonly EnvironmentPreset[] = [
@@ -90,6 +98,7 @@ export const ENVIRONMENT_PRESETS: readonly EnvironmentPreset[] = [
       ventilation: 0.3,
       systems: 0.15,
       communications: 0.1,
+      hull: 0.25,
     },
   },
   {
@@ -102,6 +111,7 @@ export const ENVIRONMENT_PRESETS: readonly EnvironmentPreset[] = [
       ventilation: 0.65,
       systems: 0.45,
       communications: 0.25,
+      hull: 0.2,
     },
   },
   {
@@ -114,6 +124,7 @@ export const ENVIRONMENT_PRESETS: readonly EnvironmentPreset[] = [
       ventilation: 0.15,
       systems: 0.05,
       communications: 0.1,
+      hull: 0.15,
     },
   },
   {
@@ -126,6 +137,7 @@ export const ENVIRONMENT_PRESETS: readonly EnvironmentPreset[] = [
       ventilation: 0.85,
       systems: 0.35,
       communications: 0.05,
+      hull: 0.35,
     },
   },
 ] as const;
@@ -144,6 +156,7 @@ export function createInitialMixerState(): MixerState {
       ventilation: { enabled: false, volume: 0.65 },
       systems: { enabled: false, volume: 0.4 },
       communications: { enabled: false, volume: 0.3 },
+      hull: { enabled: false, volume: 0.25 },
     },
   };
 }

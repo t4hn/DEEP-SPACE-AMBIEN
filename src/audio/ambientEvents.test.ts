@@ -15,7 +15,7 @@ import {
 } from './ambientEvents';
 import { createInitialMixerState, mixerReducer } from './mixerState';
 
-test('ambient event catalogue defines the five expected shipboard event types', () => {
+test('ambient event catalogue defines all expected shipboard event types including structural events', () => {
   assert.deepEqual(
     AMBIENT_EVENTS.map((e) => e.type),
     [
@@ -24,6 +24,8 @@ test('ambient event catalogue defines the five expected shipboard event types', 
       'communications-interference',
       'system-diagnostic',
       'sensor-anomaly',
+      'structural-resonance',
+      'hull-stress',
     ],
   );
 });
@@ -118,12 +120,43 @@ test('per-event cooldowns prevent repetition and keep rare sensor-anomaly spaced
   const eligible = getEligibleAmbientEvents(state, now, lastTriggered);
   assert.deepEqual(
     eligible.map((e) => e.type),
-    ['navigation-beacon', 'communications-interference', 'system-diagnostic'],
+    [
+      'navigation-beacon',
+      'communications-interference',
+      'system-diagnostic',
+      'structural-resonance',
+      'hull-stress',
+    ],
   );
 
   // After 180s, sensor-anomaly becomes eligible again
   const laterEligible = getEligibleAmbientEvents(state, now + 50_000, lastTriggered);
   assert.ok(laterEligible.some((e) => e.type === 'sensor-anomaly'));
+});
+
+test('hull-only listening permits strictly structural-resonance and hull-stress routed to hull', () => {
+  let state = createInitialMixerState();
+  state = mixerReducer(state, { type: 'TOGGLE_CHANNEL', channelId: 'hull' });
+  state = mixerReducer(state, { type: 'TOGGLE_AMBIENT_EVENTS' });
+
+  const eligible = getEligibleAmbientEvents(state, 500_000, {});
+  assert.deepEqual(
+    eligible.map((e) => e.type),
+    ['structural-resonance', 'hull-stress'],
+  );
+
+  const selection = selectAmbientEvent(eligible, state, () => 0.25);
+  assert.ok(selection);
+  assert.equal(selection.targetChannel, 'hull');
+
+  // Disabling hull excludes structural events when another channel (e.g. reactor) is active
+  state = mixerReducer(state, { type: 'TOGGLE_CHANNEL', channelId: 'reactor' });
+  state = mixerReducer(state, { type: 'TOGGLE_CHANNEL', channelId: 'hull' });
+  const reactorOnlyEligible = getEligibleAmbientEvents(state, 500_000, {});
+  assert.deepEqual(
+    reactorOnlyEligible.map((e) => e.type),
+    ['reactor-fluctuation'],
+  );
 });
 
 test('conservative scheduler computes initial delay, 30-90s typical intervals, and rare silence gaps', () => {

@@ -5,7 +5,9 @@ export type AmbientEventType =
   | 'navigation-beacon'
   | 'communications-interference'
   | 'system-diagnostic'
-  | 'sensor-anomaly';
+  | 'sensor-anomaly'
+  | 'structural-resonance'
+  | 'hull-stress';
 
 export interface AmbientEventDescriptor {
   type: AmbientEventType;
@@ -68,6 +70,22 @@ export const AMBIENT_EVENTS: readonly AmbientEventDescriptor[] = [
     supportedChannels: ['systems', 'communications'],
     weight: 0.4,
     cooldownMs: 180_000,
+  },
+  {
+    type: 'structural-resonance',
+    label: 'Structural Resonance',
+    statusText: 'Structural resonance detected',
+    supportedChannels: ['hull'],
+    weight: 0.65,
+    cooldownMs: 130_000,
+  },
+  {
+    type: 'hull-stress',
+    label: 'Hull Stress',
+    statusText: 'Hull stress load recorded',
+    supportedChannels: ['hull'],
+    weight: 0.55,
+    cooldownMs: 150_000,
   },
 ] as const;
 

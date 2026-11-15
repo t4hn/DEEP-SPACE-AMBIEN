@@ -26,11 +26,12 @@ test('initial mixer state starts in standby with all channels off and default le
   }
 });
 
-test('PLAY_ALL activates environment and enables all five channels simultaneously', () => {
+test('PLAY_ALL activates environment and enables all six channels simultaneously', () => {
   const initial = createInitialMixerState();
   const next = mixerReducer(initial, { type: 'PLAY_ALL' });
+  assert.equal(CHANNELS.length, 6);
   assert.equal(next.isActive, true);
-  assert.equal(countEnabledChannels(next), 5);
+  assert.equal(countEnabledChannels(next), 6);
   for (const ch of CHANNELS) {
     assert.equal(next.channels[ch.id].enabled, true);
     assert.ok(effectiveChannelGain(next, ch.id) > 0);
@@ -126,7 +127,8 @@ test('RESET restores default volumes and clears preset while preserving active v
   assert.equal(resetActive.masterVolume, DEFAULT_MASTER_VOLUME);
   assert.equal(resetActive.channels.reactor.volume, 0.75);
   assert.equal(resetActive.channels.communications.volume, 0.3);
-  assert.equal(countEnabledChannels(resetActive), 5);
+  assert.equal(resetActive.channels.hull.volume, 0.25);
+  assert.equal(countEnabledChannels(resetActive), 6);
 });
 
 test('all four environment presets apply exact volumes, disable 0% channels, and keep master independent', () => {
@@ -144,11 +146,18 @@ test('all four environment presets apply exact volumes, disable 0% channels, and
   assert.equal(state.masterVolume, 0.55);
   assert.deepEqual(
     Object.fromEntries(CHANNELS.map((c) => [c.id, state.channels[c.id].volume])),
-    { reactor: 0.65, engines: 0.85, ventilation: 0.3, systems: 0.15, communications: 0.1 },
+    {
+      reactor: 0.65,
+      engines: 0.85,
+      ventilation: 0.3,
+      systems: 0.15,
+      communications: 0.1,
+      hull: 0.25,
+    },
   );
-  assert.equal(countEnabledChannels(state), 5);
+  assert.equal(countEnabledChannels(state), 6);
 
-  // Silent Watch (Engines 0% -> disabled)
+  // Silent Watch (Engines 0% -> disabled, Hull 15% -> enabled)
   state = mixerReducer(state, { type: 'SELECT_PRESET', presetId: 'silent-watch' });
   assert.equal(state.isActive, true);
   assert.equal(state.activePresetId, 'silent-watch');
@@ -156,7 +165,9 @@ test('all four environment presets apply exact volumes, disable 0% channels, and
   assert.equal(state.channels.engines.volume, 0);
   assert.equal(state.channels.engines.enabled, false);
   assert.equal(effectiveChannelGain(state, 'engines'), 0);
-  assert.equal(countEnabledChannels(state), 4);
+  assert.equal(state.channels.hull.volume, 0.15);
+  assert.equal(state.channels.hull.enabled, true);
+  assert.equal(countEnabledChannels(state), 5);
 
   // Research Station
   state = mixerReducer(state, { type: 'SELECT_PRESET', presetId: 'research-station' });
@@ -167,6 +178,7 @@ test('all four environment presets apply exact volumes, disable 0% channels, and
   assert.equal(state.channels.ventilation.volume, 0.65);
   assert.equal(state.channels.systems.volume, 0.45);
   assert.equal(state.channels.communications.volume, 0.25);
+  assert.equal(state.channels.hull.volume, 0.2);
 
   // Engineering Deck
   state = mixerReducer(state, { type: 'SELECT_PRESET', presetId: 'engineering-deck' });
@@ -177,6 +189,7 @@ test('all four environment presets apply exact volumes, disable 0% channels, and
   assert.equal(state.channels.ventilation.volume, 0.85);
   assert.equal(state.channels.systems.volume, 0.35);
   assert.equal(state.channels.communications.volume, 0.05);
+  assert.equal(state.channels.hull.volume, 0.35);
   assert.equal(state.masterVolume, 0.55);
 });
 
@@ -248,11 +261,36 @@ test('ambientEventsEnabled defaults to false, toggles independently, and resets 
   assert.equal(toggledOff.ambientEventsEnabled, false);
   assert.equal(toggledOff.isActive, true);
   assert.equal(toggledOff.activePresetId, 'deep-transit');
-  assert.equal(countEnabledChannels(toggledOff), 5);
+  assert.equal(countEnabledChannels(toggledOff), 6);
 
   // Reset restores ambientEventsEnabled back to false
   const reEnabled = mixerReducer(toggledOff, { type: 'TOGGLE_AMBIENT_EVENTS' });
   const afterReset = mixerReducer(reEnabled, { type: 'RESET' });
   assert.equal(afterReset.ambientEventsEnabled, false);
+});
+
+test('CH-06 hull channel enables/disables independently and adjusts volume cleanly', () => {
+  let state = createInitialMixerState();
+  assert.equal(state.channels.hull.volume, 0.25);
+  assert.equal(state.channels.hull.enabled, false);
+
+  state = mixerReducer(state, { type: 'TOGGLE_CHANNEL', channelId: 'hull' });
+  assert.equal(state.isActive, true);
+  assert.equal(state.channels.hull.enabled, true);
+  assert.equal(countEnabledChannels(state), 1);
+  assert.ok(effectiveChannelGain(state, 'hull') > 0);
+
+  state = mixerReducer(state, {
+    type: 'SET_CHANNEL_VOLUME',
+    channelId: 'hull',
+    volume: 0.42,
+  });
+  assert.equal(state.channels.hull.volume, 0.42);
+  assert.ok(effectiveChannelGain(state, 'hull') > sliderToGain(0.25));
+
+  state = mixerReducer(state, { type: 'TOGGLE_CHANNEL', channelId: 'hull' });
+  assert.equal(state.isActive, false);
+  assert.equal(state.channels.hull.enabled, false);
+  assert.equal(effectiveChannelGain(state, 'hull'), 0);
 });
 
