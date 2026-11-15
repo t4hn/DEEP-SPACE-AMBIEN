@@ -1,4 +1,5 @@
-import { createRef, useEffect, useReducer, useRef } from 'react';
+import { createRef, useEffect, useReducer, useRef, useState } from 'react';
+import type { AmbientEventDescriptor } from './audio/ambientEvents';
 import { DeepSpaceEngine } from './audio/deepSpaceEngine';
 import {
   CHANNELS,
@@ -14,6 +15,7 @@ import { PresetSelector } from './components/PresetSelector';
 
 export default function App() {
   const [state, dispatch] = useReducer(mixerReducer, undefined, createInitialMixerState);
+  const [lastAmbientEvent, setLastAmbientEvent] = useState<AmbientEventDescriptor | null>(null);
   const engineRef = useRef<DeepSpaceEngine | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -28,7 +30,11 @@ export default function App() {
 
   // Lazily create engine and dispose on unmount
   useEffect(() => {
-    const engine = new DeepSpaceEngine();
+    const engine = new DeepSpaceEngine({
+      onAmbientEvent: (ev) => {
+        setLastAmbientEvent(ev);
+      },
+    });
     engineRef.current = engine;
     return () => {
       engine.dispose();
@@ -42,6 +48,13 @@ export default function App() {
     if (!engine) return;
     void engine.syncState(state);
   }, [state]);
+
+  // Clear recent event readout whenever Ambient Events are disabled or audio stops
+  useEffect(() => {
+    if (!state.ambientEventsEnabled || !state.isActive) {
+      setLastAmbientEvent(null);
+    }
+  }, [state.ambientEventsEnabled, state.isActive]);
 
   // Lightweight direct-DOM meter updates only while audio environment is active
   useEffect(() => {
@@ -129,18 +142,35 @@ export default function App() {
     dispatch({ type: 'SELECT_PRESET', presetId });
   };
 
+  const handleToggleAmbientEvents = () => {
+    if (state.ambientEventsEnabled) {
+      setLastAmbientEvent(null);
+    }
+    dispatch({ type: 'TOGGLE_AMBIENT_EVENTS' });
+  };
+
+  const handleStopAll = () => {
+    setLastAmbientEvent(null);
+    dispatch({ type: 'STOP_ALL' });
+  };
+
+  const handleReset = () => {
+    setLastAmbientEvent(null);
+    dispatch({ type: 'RESET' });
+  };
+
   const activeChannelCount = countEnabledChannels(state);
 
   return (
     <div className="min-h-screen bg-[#07090b] text-zinc-100 flex flex-col">
-      <main className="w-full max-w-5xl mx-auto px-4 py-5 sm:px-8 sm:py-6 flex-1 flex flex-col justify-center">
+      <main className="w-full max-w-5xl mx-auto px-4 py-4 sm:px-8 sm:py-4 flex-1 flex flex-col justify-center">
         {/* Console Header */}
-        <header className="flex flex-col gap-3 pb-4 mb-4 border-b border-zinc-800/90 sm:flex-row sm:items-end sm:justify-between">
+        <header className="flex flex-col gap-2 pb-3 mb-3 border-b border-zinc-800/90 sm:flex-row sm:items-end sm:justify-between">
           <div>
             <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-zinc-100">
               DEEP SPACE
             </h1>
-            <p className="mt-1 text-xs font-mono tracking-[0.18em] text-zinc-400">
+            <p className="mt-0.5 text-xs font-mono tracking-[0.18em] text-zinc-400">
               SHIPBOARD AUDIO ENVIRONMENT
             </p>
           </div>
@@ -164,23 +194,26 @@ export default function App() {
         </header>
 
         {/* Master Controls */}
-        <div className="mb-3.5">
+        <div className="mb-3">
           <MasterControls
             isActive={state.isActive}
             masterVolume={state.masterVolume}
             activeChannelCount={activeChannelCount}
             totalChannels={CHANNELS.length}
+            ambientEventsEnabled={state.ambientEventsEnabled}
+            lastAmbientEvent={lastAmbientEvent}
             onPlayAll={handlePlayAll}
-            onStopAll={() => dispatch({ type: 'STOP_ALL' })}
-            onReset={() => dispatch({ type: 'RESET' })}
+            onStopAll={handleStopAll}
+            onReset={handleReset}
             onMasterVolumeChange={(volume) =>
               dispatch({ type: 'SET_MASTER_VOLUME', volume })
             }
+            onToggleAmbientEvents={handleToggleAmbientEvents}
           />
         </div>
 
         {/* Compact Environment Presets */}
-        <div className="mb-3.5">
+        <div className="mb-3">
           <PresetSelector
             activePresetId={state.activePresetId}
             onSelectPreset={handleSelectPreset}
@@ -188,7 +221,7 @@ export default function App() {
         </div>
 
         {/* Five Independent Audio Channels */}
-        <section aria-label="Audio Channels" className="flex flex-col gap-2.5">
+        <section aria-label="Audio Channels" className="flex flex-col gap-2">
           {CHANNELS.map((ch) => (
             <ChannelStrip
               key={ch.id}

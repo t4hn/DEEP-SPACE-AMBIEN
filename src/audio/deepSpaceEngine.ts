@@ -1,4 +1,11 @@
 import {
+  type AmbientEventDescriptor,
+  type AmbientEventType,
+  computeAmbientEventDelayMs,
+  getEligibleAmbientEvents,
+  selectAmbientEvent,
+} from './ambientEvents';
+import {
   CHANNELS,
   type ChannelId,
   type MixerState,
@@ -8,10 +15,15 @@ import {
 
 interface ChannelAudioNodes {
   gain: GainNode;
+  eventBus: GainNode;
   analyser: AnalyserNode;
   start?: () => void;
   stop?: () => void;
   cleanup: () => void;
+}
+
+export interface DeepSpaceEngineOptions {
+  onAmbientEvent?: (event: AmbientEventDescriptor | null) => void;
 }
 
 /**
@@ -141,31 +153,61 @@ export class DeepSpaceEngine {
   private suspendTimer: number | null = null;
   private disposed = false;
 
-  private readonly handleVisibilityOrFocus = (): void => {
-    if (this.disposed || !this.ctx || !this.latestState?.isActive) return;
+  // Optional procedural Ambient Event System state
+  private onAmbientEvent?: (event: AmbientEventDescriptor | null) => void;
+  private eventVoices = new TransientVoicePool();
+  private eventNoiseBuf: AudioBuffer | null = null;
+  private eventTimerId: number | null = null;
+  private activeEventTimerId: number | null = null;
+  private activeEventTarget: ChannelId | null = null;
+  private eventGeneration = 0;
+  private lastEventTriggeredAt: Partial<Record<AmbientEventType, number>> = {};
+  private schedulerRunning = false;
+  private overrideEventDelayMs: number | null = null;
 
-    if (typeof document !== 'undefined' && !document.hidden) {
-      if (this.ctx.state !== 'running') {
-        void this.ctx.resume().catch(() => {
-          // Will retry on next user gesture if browser blocks background resume
-        });
-      }
-      // Ensure intermittent schedulers resume cleanly when returning to tab
-      if (this.latestState.channels.systems.enabled) {
-        this.channels.systems?.start?.();
-      }
-      if (this.latestState.channels.communications.enabled) {
-        this.channels.communications?.start?.();
-      }
+  private readonly handleVisibilityOrFocus = (): void => {
+    if (this.disposed) return;
+
+    if (typeof document !== 'undefined' && document.hidden) {
+      this.clearEventScheduleTimer();
+      return;
+    }
+
+    if (!this.ctx || !this.latestState?.isActive) return;
+
+    if (this.ctx.state !== 'running') {
+      void this.ctx.resume().catch(() => {
+        // Will retry on next user gesture if browser blocks background resume
+      });
+    }
+    // Ensure intermittent schedulers resume cleanly when returning to tab
+    if (this.latestState.channels.systems.enabled) {
+      this.channels.systems?.start?.();
+    }
+    if (this.latestState.channels.communications.enabled) {
+      this.channels.communications?.start?.();
+    }
+    // Resume ambient event scheduling with a fresh delay (never firing immediately on tab return)
+    if (this.latestState.ambientEventsEnabled && this.eventTimerId === null) {
+      this.scheduleNextAmbientEvent(true);
     }
   };
 
-  constructor() {
+  constructor(options?: DeepSpaceEngineOptions) {
+    this.onAmbientEvent = options?.onAmbientEvent;
+
+    if (typeof window !== 'undefined') {
+      const raw = new URLSearchParams(window.location.search).get('ambientEventMs');
+      if (raw !== null) {
+        const parsed = Number(raw);
+        if (Number.isFinite(parsed) && parsed > 0) {
+          this.overrideEventDelayMs = Math.max(80, parsed);
+        }
+      }
+      window.addEventListener('focus', this.handleVisibilityOrFocus);
+    }
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', this.handleVisibilityOrFocus);
-    }
-    if (typeof window !== 'undefined') {
-      window.addEventListener('focus', this.handleVisibilityOrFocus);
     }
   }
 
@@ -241,12 +283,17 @@ export class DeepSpaceEngine {
 
   private createChannelBus(ctx: AudioContext, destination: AudioNode): {
     input: GainNode;
+    eventBus: GainNode;
     outputGain: GainNode;
     analyser: AnalyserNode;
     disconnectBus: () => void;
   } {
     const input = ctx.createGain();
     input.gain.value = 1;
+
+    const eventBus = ctx.createGain();
+    eventBus.gain.value = 1;
+    eventBus.connect(input);
 
     const outputGain = ctx.createGain();
     outputGain.gain.value = 0;
@@ -261,9 +308,11 @@ export class DeepSpaceEngine {
 
     return {
       input,
+      eventBus,
       outputGain,
       analyser,
       disconnectBus: () => {
+        eventBus.disconnect();
         input.disconnect();
         outputGain.disconnect();
         analyser.disconnect();
@@ -275,7 +324,7 @@ export class DeepSpaceEngine {
    * CH-01: Reactor — Deep, warm, continuous mechanical hum with subtle fluctuations
    */
   private buildReactorChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
-    const { input, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
+    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
 
     // Subsonic highpass removes DC / ultra-low mud without thinning the 52 Hz core
     const subsonicFilter = ctx.createBiquadFilter();
@@ -353,6 +402,7 @@ export class DeepSpaceEngine {
 
     return {
       gain: outputGain,
+      eventBus,
       analyser,
       cleanup: () => {
         for (const src of [osc1, osc2, osc3, osc4, lfo1, lfo2, noiseSrc]) {
@@ -381,7 +431,7 @@ export class DeepSpaceEngine {
    * CH-02: Engines — Layered, low-frequency mechanical rumble
    */
   private buildEnginesChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
-    const { input, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
+    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
 
     const subsonicHp = ctx.createBiquadFilter();
     subsonicHp.type = 'highpass';
@@ -458,6 +508,7 @@ export class DeepSpaceEngine {
 
     return {
       gain: outputGain,
+      eventBus,
       analyser,
       cleanup: () => {
         for (const src of [srcA, srcB, driveOsc1, driveOsc2, lfoA, lfoB]) {
@@ -486,7 +537,7 @@ export class DeepSpaceEngine {
    * CH-03: Ventilation — Soft, consistent airflow without excessive high-frequency noise
    */
   private buildVentilationChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
-    const { input, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
+    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
 
     const highpass = ctx.createBiquadFilter();
     highpass.type = 'highpass';
@@ -544,6 +595,7 @@ export class DeepSpaceEngine {
 
     return {
       gain: outputGain,
+      eventBus,
       analyser,
       cleanup: () => {
         for (const src of [src1, src2, lfo]) {
@@ -574,7 +626,7 @@ export class DeepSpaceEngine {
    * D. Diagnostic Sequences (coherent multi-note system check routines)
    */
   private buildSystemsChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
-    const { input, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
+    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
 
     // Master lowpass keeps all computational activity warm and non-fatiguing
     const busToneFilter = ctx.createBiquadFilter();
@@ -878,6 +930,7 @@ export class DeepSpaceEngine {
 
     return {
       gain: outputGain,
+      eventBus,
       analyser,
       start,
       stop,
@@ -918,7 +971,7 @@ export class DeepSpaceEngine {
    * D. Signal Interference & Loss (restrained narrowband RF interference & soft squelch cutoffs)
    */
   private buildCommunicationsChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
-    const { input, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
+    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
 
     // Band-limit Communications to clean narrow receiver spectrum (no sub-mud, no harsh hiss)
     const commsHighpass = ctx.createBiquadFilter();
@@ -1234,6 +1287,7 @@ export class DeepSpaceEngine {
 
     return {
       gain: outputGain,
+      eventBus,
       analyser,
       start,
       stop,
@@ -1306,9 +1360,23 @@ export class DeepSpaceEngine {
       } else {
         this.channels.communications?.stop?.();
       }
+
+      // Optional Ambient Event System synchronization
+      if (!state.ambientEventsEnabled) {
+        this.stopAmbientEvents(true);
+      } else {
+        if (this.activeEventTarget && !state.channels[this.activeEventTarget].enabled) {
+          this.stopActiveEventVoice(true);
+        }
+        if (!this.schedulerRunning) {
+          this.schedulerRunning = true;
+          this.scheduleNextAmbientEvent(true);
+        }
+      }
     } else {
-      // Stop All / last channel turned off: stop intermittent schedulers immediately,
+      // Stop All / last channel turned off: stop intermittent schedulers and ambient events immediately,
       // perform a fast 40ms click-free fade to exact 0, and suspend AudioContext.
+      this.stopAmbientEvents(true);
       this.channels.systems?.stop?.();
       this.channels.communications?.stop?.();
 
@@ -1334,6 +1402,457 @@ export class DeepSpaceEngine {
         }
       }, 60);
     }
+  }
+
+  private clearEventScheduleTimer(): void {
+    if (this.eventTimerId !== null) {
+      window.clearTimeout(this.eventTimerId);
+      this.eventTimerId = null;
+    }
+  }
+
+  private clearActiveEventTimer(): void {
+    if (this.activeEventTimerId !== null) {
+      window.clearTimeout(this.activeEventTimerId);
+      this.activeEventTimerId = null;
+    }
+  }
+
+  private stopActiveEventVoice(immediate = false): void {
+    this.clearActiveEventTimer();
+    const target = this.activeEventTarget;
+    this.activeEventTarget = null;
+
+    if (!this.ctx) return;
+    const now = this.ctx.currentTime;
+    if (target) {
+      const bus = this.channels[target]?.eventBus;
+      if (bus) {
+        bus.gain.cancelScheduledValues(now);
+        bus.gain.setValueAtTime(bus.gain.value, now);
+        bus.gain.linearRampToValueAtTime(0, now + 0.015);
+      }
+    }
+    this.eventVoices.stopAll(now, immediate || this.ctx.state !== 'running');
+  }
+
+  private stopAmbientEvents(immediate = false): void {
+    this.schedulerRunning = false;
+    this.eventGeneration += 1;
+    this.clearEventScheduleTimer();
+    this.stopActiveEventVoice(immediate);
+  }
+
+  private scheduleNextAmbientEvent(isInitial: boolean): void {
+    if (this.disposed || !this.latestState?.ambientEventsEnabled || !this.latestState?.isActive) {
+      return;
+    }
+    if (typeof document !== 'undefined' && document.hidden) {
+      this.clearEventScheduleTimer();
+      return;
+    }
+
+    this.clearEventScheduleTimer();
+    const generation = this.eventGeneration;
+    const delayMs = computeAmbientEventDelayMs({
+      isInitial,
+      overrideMs: this.overrideEventDelayMs,
+    });
+
+    this.eventTimerId = window.setTimeout(() => {
+      this.eventTimerId = null;
+      this.onAmbientEventTick(generation);
+    }, delayMs);
+  }
+
+  private onAmbientEventTick(generation: number): void {
+    if (this.disposed || generation !== this.eventGeneration) return;
+    const state = this.latestState;
+    if (!state || !state.ambientEventsEnabled || !state.isActive) return;
+    if (typeof document !== 'undefined' && document.hidden) return;
+
+    // Never overlap events: wait for active event completion before scheduling another
+    if (this.activeEventTarget !== null) {
+      this.scheduleNextAmbientEvent(false);
+      return;
+    }
+
+    const nowMs = Date.now();
+    const eligible = getEligibleAmbientEvents(state, nowMs, this.lastEventTriggeredAt);
+    const selection = selectAmbientEvent(eligible, state);
+
+    if (selection && this.ctx && this.ctx.state === 'running') {
+      const durationSec = this.playAmbientEvent(selection.event.type, selection.targetChannel);
+      if (durationSec > 0) {
+        this.lastEventTriggeredAt[selection.event.type] = nowMs;
+        this.activeEventTarget = selection.targetChannel;
+        this.onAmbientEvent?.(selection.event);
+
+        const activeGen = this.eventGeneration;
+        this.clearActiveEventTimer();
+        this.activeEventTimerId = window.setTimeout(() => {
+          this.activeEventTimerId = null;
+          if (this.disposed || activeGen !== this.eventGeneration) return;
+          this.activeEventTarget = null;
+          this.scheduleNextAmbientEvent(false);
+        }, Math.round(durationSec * 1000) + 120);
+        return;
+      }
+    }
+
+    // No eligible event (e.g. only Engines/Ventilation active) — recheck conservatively later
+    this.scheduleNextAmbientEvent(false);
+  }
+
+  private getEventNoiseBuffer(ctx: AudioContext): AudioBuffer {
+    if (!this.eventNoiseBuf) {
+      this.eventNoiseBuf = createSeamlessNoiseBuffer(ctx, 5.3, 'pink');
+    }
+    return this.eventNoiseBuf;
+  }
+
+  private playAmbientEvent(eventType: AmbientEventType, targetChannel: ChannelId): number {
+    const ctx = this.ctx;
+    const node = this.channels[targetChannel];
+    if (!ctx || !node) return 0;
+
+    const now = ctx.currentTime;
+    // Restore channel eventBus smoothly before spawning the new event
+    node.eventBus.gain.cancelScheduledValues(now);
+    node.eventBus.gain.setValueAtTime(1, now);
+
+    switch (eventType) {
+      case 'reactor-fluctuation':
+        return this.triggerReactorFluctuation(ctx, node.eventBus, now);
+      case 'navigation-beacon':
+        return this.triggerNavigationBeacon(ctx, node.eventBus, now);
+      case 'communications-interference':
+        return this.triggerCommsInterference(ctx, node.eventBus, now);
+      case 'system-diagnostic':
+        return this.triggerSystemDiagnostic(ctx, node.eventBus, now);
+      case 'sensor-anomaly':
+        return this.triggerSensorAnomaly(ctx, node.eventBus, now);
+    }
+  }
+
+  /**
+   * Event 1: Reactor Fluctuation — brief harmonic & low-frequency modulation swell
+   */
+  private triggerReactorFluctuation(ctx: AudioContext, dest: AudioNode, start: number): number {
+    const duration = 3.2;
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(115, start);
+    lp.frequency.linearRampToValueAtTime(195, start + 1.3);
+    lp.frequency.linearRampToValueAtTime(115, start + duration);
+    lp.Q.value = 1.6;
+
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0.0001, start);
+    env.gain.linearRampToValueAtTime(0.14, start + 1.15);
+    env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+    const oscA = ctx.createOscillator();
+    oscA.type = 'sine';
+    oscA.frequency.setValueAtTime(52.4, start);
+    oscA.frequency.linearRampToValueAtTime(51.7, start + 1.6);
+    oscA.frequency.linearRampToValueAtTime(52.1, start + duration);
+
+    const oscB = ctx.createOscillator();
+    oscB.type = 'triangle';
+    oscB.frequency.setValueAtTime(104.2, start);
+    oscB.frequency.linearRampToValueAtTime(103.5, start + 1.6);
+    oscB.frequency.linearRampToValueAtTime(104.0, start + duration);
+
+    const gB = ctx.createGain();
+    gB.gain.value = 0.28;
+
+    const mod = ctx.createOscillator();
+    mod.type = 'sine';
+    mod.frequency.value = 0.65;
+    const modGain = ctx.createGain();
+    modGain.gain.value = 26;
+    mod.connect(modGain).connect(lp.frequency);
+
+    oscA.connect(lp);
+    oscB.connect(gB).connect(lp);
+    lp.connect(env).connect(dest);
+
+    this.eventVoices.track(oscA, () => {
+      oscA.disconnect();
+      lp.disconnect();
+      env.disconnect();
+    });
+    this.eventVoices.track(oscB, () => {
+      oscB.disconnect();
+      gB.disconnect();
+    });
+    this.eventVoices.track(mod, () => {
+      mod.disconnect();
+      modGain.disconnect();
+    });
+
+    oscA.start(start);
+    oscB.start(start);
+    mod.start(start);
+    oscA.stop(start + duration + 0.04);
+    oscB.stop(start + duration + 0.04);
+    mod.stop(start + duration + 0.04);
+
+    return duration;
+  }
+
+  /**
+   * Event 2: Navigation Beacon — distant, short three-pulse narrowband RF beacon
+   */
+  private triggerNavigationBeacon(ctx: AudioContext, dest: AudioNode, start: number): number {
+    const carrierBase = 880 + Math.random() * 240;
+    const panVal = (Math.random() - 0.5) * 0.65;
+    const pulses = [
+      { offset: 0, dur: 0.22, freq: carrierBase },
+      { offset: 0.42, dur: 0.22, freq: carrierBase },
+      { offset: 0.86, dur: 0.52, freq: carrierBase * 1.125 },
+    ];
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = carrierBase * 1.04;
+    bp.Q.value = 5.5;
+
+    const pan = ctx.createStereoPanner();
+    pan.pan.value = panVal;
+    bp.connect(pan).connect(dest);
+
+    let remaining = pulses.length;
+    for (const p of pulses) {
+      const t = start + p.offset;
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(p.freq, t);
+
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0.0001, t);
+      env.gain.linearRampToValueAtTime(0.045, t + 0.035);
+      env.gain.exponentialRampToValueAtTime(0.0001, t + p.dur);
+
+      osc.connect(env).connect(bp);
+      this.eventVoices.track(osc, () => {
+        osc.disconnect();
+        env.disconnect();
+        remaining -= 1;
+        if (remaining <= 0) {
+          bp.disconnect();
+          pan.disconnect();
+        }
+      });
+
+      osc.start(t);
+      osc.stop(t + p.dur + 0.03);
+    }
+
+    return 1.5;
+  }
+
+  /**
+   * Event 3: Communications Interference — restrained narrowband RF disruption & flutter
+   */
+  private triggerCommsInterference(ctx: AudioContext, dest: AudioNode, start: number): number {
+    const duration = 1.65;
+    const centerFreq = 640 + Math.random() * 320;
+    const panVal = (Math.random() - 0.5) * 0.7;
+
+    const noiseSrc = ctx.createBufferSource();
+    noiseSrc.buffer = this.getEventNoiseBuffer(ctx);
+    noiseSrc.loop = true;
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(centerFreq, start);
+    bp.frequency.linearRampToValueAtTime(centerFreq * 0.65, start + 0.75);
+    bp.frequency.linearRampToValueAtTime(centerFreq * 1.15, start + duration);
+    bp.Q.value = 8.0;
+
+    const noiseEnv = ctx.createGain();
+    noiseEnv.gain.setValueAtTime(0.0001, start);
+    noiseEnv.gain.linearRampToValueAtTime(0.044, start + 0.14);
+    noiseEnv.gain.linearRampToValueAtTime(0.018, start + 0.85);
+    noiseEnv.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+    const carrier = ctx.createOscillator();
+    carrier.type = 'sine';
+    carrier.frequency.value = centerFreq * 0.92;
+
+    const flutter = ctx.createOscillator();
+    flutter.type = 'sine';
+    flutter.frequency.value = 14 + Math.random() * 7;
+    const flutterGain = ctx.createGain();
+    flutterGain.gain.value = 18;
+    flutter.connect(flutterGain).connect(carrier.frequency);
+
+    const carrierEnv = ctx.createGain();
+    carrierEnv.gain.setValueAtTime(0.0001, start);
+    carrierEnv.gain.linearRampToValueAtTime(0.022, start + 0.18);
+    carrierEnv.gain.exponentialRampToValueAtTime(0.0001, start + duration * 0.85);
+
+    const pan = ctx.createStereoPanner();
+    pan.pan.value = panVal;
+
+    noiseSrc.connect(bp).connect(noiseEnv).connect(pan).connect(dest);
+    carrier.connect(carrierEnv).connect(pan);
+
+    this.eventVoices.track(noiseSrc, () => {
+      noiseSrc.disconnect();
+      bp.disconnect();
+      noiseEnv.disconnect();
+      pan.disconnect();
+    });
+    this.eventVoices.track(carrier, () => {
+      carrier.disconnect();
+      carrierEnv.disconnect();
+    });
+    this.eventVoices.track(flutter, () => {
+      flutter.disconnect();
+      flutterGain.disconnect();
+    });
+
+    noiseSrc.start(start, Math.random() * 3.2);
+    carrier.start(start);
+    flutter.start(start);
+    noiseSrc.stop(start + duration + 0.03);
+    carrier.stop(start + duration + 0.03);
+    flutter.stop(start + duration + 0.03);
+
+    return duration;
+  }
+
+  /**
+   * Event 4: System Diagnostic — short coherent sequence of related telemetry tones
+   */
+  private triggerSystemDiagnostic(ctx: AudioContext, dest: AudioNode, start: number): number {
+    const notes = [392.0, 493.88, 587.33, 440.0];
+    const stepSec = 0.165;
+    const panVal = (Math.random() - 0.5) * 0.3;
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 1320;
+    lp.Q.value = 0.7;
+
+    const pan = ctx.createStereoPanner();
+    pan.pan.value = panVal;
+    lp.connect(pan).connect(dest);
+
+    let remaining = notes.length;
+    notes.forEach((freq, idx) => {
+      const t = start + idx * stepSec;
+      const isLast = idx === notes.length - 1;
+      const dur = isLast ? 0.34 : 0.16;
+      const peak = isLast ? 0.056 : 0.044;
+
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0.0001, t);
+      env.gain.linearRampToValueAtTime(peak, t + 0.014);
+      env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+      osc.connect(env).connect(lp);
+      this.eventVoices.track(osc, () => {
+        osc.disconnect();
+        env.disconnect();
+        remaining -= 1;
+        if (remaining <= 0) {
+          lp.disconnect();
+          pan.disconnect();
+        }
+      });
+
+      osc.start(t);
+      osc.stop(t + dur + 0.03);
+    });
+
+    return notes.length * stepSec + 0.4;
+  }
+
+  /**
+   * Event 5: Sensor Anomaly — faint, unusual beating pulse & subtle echo on Systems or Comms
+   */
+  private triggerSensorAnomaly(ctx: AudioContext, dest: AudioNode, start: number): number {
+    const duration = 2.6;
+    const baseFreq = 685 + Math.random() * 140;
+    const panVal = (Math.random() - 0.5) * 0.5;
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = baseFreq;
+    bp.Q.value = 4.6;
+
+    const pan = ctx.createStereoPanner();
+    pan.pan.value = panVal;
+    bp.connect(pan).connect(dest);
+
+    const osc1 = ctx.createOscillator();
+    osc1.type = 'sine';
+    osc1.frequency.setValueAtTime(baseFreq, start);
+    osc1.frequency.linearRampToValueAtTime(baseFreq - 22, start + 1.5);
+
+    const osc2 = ctx.createOscillator();
+    osc2.type = 'sine';
+    osc2.frequency.setValueAtTime(baseFreq * 1.03, start);
+    osc2.frequency.linearRampToValueAtTime(baseFreq * 1.015, start + 1.5);
+
+    const env1 = ctx.createGain();
+    env1.gain.setValueAtTime(0.0001, start);
+    env1.gain.linearRampToValueAtTime(0.036, start + 0.25);
+    env1.gain.exponentialRampToValueAtTime(0.0001, start + 1.65);
+
+    const echo = ctx.createOscillator();
+    echo.type = 'sine';
+    echo.frequency.value = baseFreq * 1.495;
+    const echoEnv = ctx.createGain();
+    echoEnv.gain.setValueAtTime(0.0001, start + 1.05);
+    echoEnv.gain.linearRampToValueAtTime(0.024, start + 1.25);
+    echoEnv.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+    let remaining = 3;
+    const maybeCleanupBus = () => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        bp.disconnect();
+        pan.disconnect();
+      }
+    };
+
+    osc1.connect(env1).connect(bp);
+    osc2.connect(env1);
+    echo.connect(echoEnv).connect(bp);
+
+    this.eventVoices.track(osc1, () => {
+      osc1.disconnect();
+      env1.disconnect();
+      maybeCleanupBus();
+    });
+    this.eventVoices.track(osc2, () => {
+      osc2.disconnect();
+      maybeCleanupBus();
+    });
+    this.eventVoices.track(echo, () => {
+      echo.disconnect();
+      echoEnv.disconnect();
+      maybeCleanupBus();
+    });
+
+    osc1.start(start);
+    osc2.start(start);
+    echo.start(start + 1.05);
+    osc1.stop(start + 1.7);
+    osc2.stop(start + 1.7);
+    echo.stop(start + duration + 0.03);
+
+    return duration;
   }
 
   /**
@@ -1372,6 +1891,8 @@ export class DeepSpaceEngine {
   public dispose(): void {
     this.disposed = true;
     this.clearPendingSuspend();
+    this.stopAmbientEvents(true);
+    this.eventNoiseBuf = null;
 
     if (typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', this.handleVisibilityOrFocus);

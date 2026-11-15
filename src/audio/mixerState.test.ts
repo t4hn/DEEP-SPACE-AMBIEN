@@ -216,3 +216,43 @@ test('utility math helpers behave monotonically and safely', () => {
   assert.ok(sliderToGain(0.8) > sliderToGain(0.4));
   assert.equal(formatPercent(0.754), '75%');
 });
+
+test('ambientEventsEnabled defaults to false, toggles independently, and resets to false', () => {
+  const initial = createInitialMixerState();
+  assert.equal(initial.ambientEventsEnabled, false);
+
+  // Toggling Ambient Events ON in standby does not enable channels or activate audio
+  const toggledOn = mixerReducer(initial, { type: 'TOGGLE_AMBIENT_EVENTS' });
+  assert.equal(toggledOn.ambientEventsEnabled, true);
+  assert.equal(toggledOn.isActive, false);
+  assert.equal(countEnabledChannels(toggledOn), 0);
+
+  // Selecting preset and Play/Stop All do not mutate ambientEventsEnabled
+  const withPreset = mixerReducer(toggledOn, {
+    type: 'SELECT_PRESET',
+    presetId: 'research-station',
+  });
+  assert.equal(withPreset.ambientEventsEnabled, true);
+  assert.equal(withPreset.activePresetId, 'research-station');
+
+  const stopped = mixerReducer(withPreset, { type: 'STOP_ALL' });
+  assert.equal(stopped.ambientEventsEnabled, true);
+  assert.equal(stopped.isActive, false);
+
+  // Toggling Ambient Events OFF does not disturb playing channels or selected preset
+  const playing = mixerReducer(stopped, {
+    type: 'SELECT_PRESET',
+    presetId: 'deep-transit',
+  });
+  const toggledOff = mixerReducer(playing, { type: 'TOGGLE_AMBIENT_EVENTS' });
+  assert.equal(toggledOff.ambientEventsEnabled, false);
+  assert.equal(toggledOff.isActive, true);
+  assert.equal(toggledOff.activePresetId, 'deep-transit');
+  assert.equal(countEnabledChannels(toggledOff), 5);
+
+  // Reset restores ambientEventsEnabled back to false
+  const reEnabled = mixerReducer(toggledOff, { type: 'TOGGLE_AMBIENT_EVENTS' });
+  const afterReset = mixerReducer(reEnabled, { type: 'RESET' });
+  assert.equal(afterReset.ambientEventsEnabled, false);
+});
+

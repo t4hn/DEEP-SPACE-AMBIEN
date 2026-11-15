@@ -36,6 +36,7 @@ export interface ChannelState {
 export interface MixerState {
   isActive: boolean;
   activePresetId: ActivePresetState;
+  ambientEventsEnabled: boolean;
   masterVolume: number; // 0..1 linear slider value
   channels: Record<ChannelId, ChannelState>;
 }
@@ -135,6 +136,7 @@ export function createInitialMixerState(): MixerState {
   return {
     isActive: false,
     activePresetId: null,
+    ambientEventsEnabled: false,
     masterVolume: DEFAULT_MASTER_VOLUME,
     channels: {
       reactor: { enabled: false, volume: 0.75 },
@@ -151,6 +153,7 @@ export type MixerAction =
   | { type: 'STOP_ALL' }
   | { type: 'RESET' }
   | { type: 'SELECT_PRESET'; presetId: PresetId }
+  | { type: 'TOGGLE_AMBIENT_EVENTS' }
   | { type: 'TOGGLE_CHANNEL'; channelId: ChannelId }
   | { type: 'SET_CHANNEL_VOLUME'; channelId: ChannelId; volume: number }
   | { type: 'SET_MASTER_VOLUME'; volume: number };
@@ -242,8 +245,16 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
       return {
         isActive: true,
         activePresetId: null,
+        ambientEventsEnabled: false,
         masterVolume: defaults.masterVolume,
         channels: activeDefaultChannels,
+      };
+    }
+
+    case 'TOGGLE_AMBIENT_EVENTS': {
+      return {
+        ...state,
+        ambientEventsEnabled: !state.ambientEventsEnabled,
       };
     }
 
