@@ -11,6 +11,9 @@ import {
   computeFallbackStereoPan,
   computeSpatialDistance,
   sampleCommunicationsTrajectory,
+  sampleHullCreakTrajectory,
+  sampleHullGroanTrajectory,
+  sampleHullHeavyFlexTrajectory,
   sampleHullSurroundingTrajectory,
   sampleSystemsTransientPosition,
 } from './spatialLayout';
@@ -86,4 +89,13 @@ test('transient trajectory samplers respect ship spatial zones and stationary vs
 
   const hullMoving = sampleHullSurroundingTrajectory(true, () => 0.8);
   assert.ok(computeSpatialDistance(hullMoving.end) >= 1.8);
+
+  // CH-06 creaks are closer than groans; heavy flex shifts subtly across hull sections
+  const creakNear = sampleHullCreakTrajectory(false, () => 0.5);
+  const groanFar = sampleHullGroanTrajectory(false, () => 0.5);
+  assert.ok(computeSpatialDistance(groanFar.start) > computeSpatialDistance(creakNear.start));
+
+  const heavyFlex = sampleHullHeavyFlexTrajectory(() => 0.35);
+  assert.notDeepEqual(heavyFlex.start, heavyFlex.end);
+  assert.ok(computeSpatialDistance(heavyFlex.start) >= 2.8);
 });

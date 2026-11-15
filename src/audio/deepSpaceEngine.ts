@@ -32,9 +32,22 @@ import {
   computeDistanceLowpassHz,
   computeFallbackStereoPan,
   sampleCommunicationsTrajectory,
+  sampleHullCreakTrajectory,
+  sampleHullGroanTrajectory,
+  sampleHullHeavyFlexTrajectory,
   sampleHullSurroundingTrajectory,
   sampleSystemsTransientPosition,
 } from './spatialLayout';
+import {
+  type HullCreakParams,
+  type HullGroanParams,
+  type HullHeavyFlexParams,
+  type HullScheduleState,
+  createInitialHullSchedule,
+  evaluateHullScheduleStep,
+  getNextHullWakeDelayMs,
+  reanchorHullScheduleAfterResume,
+} from './hullScheduler';
 
 interface ChannelAudioNodes {
   gain: GainNode;
@@ -42,6 +55,7 @@ interface ChannelAudioNodes {
   analyser: AnalyserNode;
   applyProfile: (profile: AcousticProfile, now: number) => void;
   start?: () => void;
+  pause?: () => void;
   stop?: () => void;
   cleanup: () => void;
 }
@@ -585,6 +599,7 @@ export class DeepSpaceEngine {
 
     if (typeof document !== 'undefined' && document.hidden) {
       this.clearEventScheduleTimer();
+      this.channels.hull?.pause?.();
       return;
     }
 
@@ -2026,7 +2041,7 @@ export class DeepSpaceEngine {
 
     hullHighpass.connect(hullLowpass).connect(input);
 
-    // Stereo-preserving spectrum shaping for 360-degree spatialized hull creaks & stress groans
+    // Stereo-preserving spectrum shaping for 360-degree spatialized hull creaks, groans & heavy flexes
     const activityHighpass = ctx.createBiquadFilter();
     activityHighpass.type = 'highpass';
     activityHighpass.frequency.value = 28;
@@ -2034,7 +2049,7 @@ export class DeepSpaceEngine {
 
     const activityLowpass = ctx.createBiquadFilter();
     activityLowpass.type = 'lowpass';
-    activityLowpass.frequency.value = 640;
+    activityLowpass.frequency.value = 760;
     activityLowpass.Q.value = 0.65;
 
     activityHighpass.connect(activityLowpass).connect(spatialInput);
@@ -2150,7 +2165,7 @@ export class DeepSpaceEngine {
     const voices = new TransientVoicePool();
     let timerId: number | null = null;
     let running = false;
-    let cycleCount = 0;
+    let scheduleState: HullScheduleState | null = null;
 
     const clearTimer = () => {
       if (timerId !== null) {
@@ -2159,33 +2174,55 @@ export class DeepSpaceEngine {
       }
     };
 
+    const scheduleUnevenBend = (
+      param: AudioParam,
+      baseFreq: number,
+      midDelta: number,
+      lateDelta: number,
+      endDelta: number,
+      start: number,
+      duration: number,
+      ratio = 1,
+    ) => {
+      param.setValueAtTime(baseFreq * ratio, start);
+      param.linearRampToValueAtTime((baseFreq + midDelta) * ratio, start + duration * 0.34);
+      param.linearRampToValueAtTime((baseFreq + lateDelta) * ratio, start + duration * 0.68);
+      param.linearRampToValueAtTime((baseFreq + endDelta) * ratio, start + duration);
+    };
+
     /**
-     * Layer B: Infrequent, slowly developing metallic hull creak (resonant flex, soft attack & decay)
+     * Layer B: Metallic Hull Creaks — heavy bulkhead & frame flexure (2–5 s, 15–35 s intervals)
      */
-    const spawnHullCreak = (start: number, trajectory: SpatialTrajectory) => {
-      const duration = 2.1 + Math.random() * 1.5;
-      const baseFreq = 112 + Math.random() * 58;
-      const bendDelta = (Math.random() < 0.5 ? -1 : 1) * (4.5 + Math.random() * 5.5);
+    const spawnHullCreak = (
+      start: number,
+      trajectory: SpatialTrajectory,
+      params: HullCreakParams,
+    ) => {
+      const { durationSec: duration, baseFreq } = params;
 
       const bp = ctx.createBiquadFilter();
       bp.type = 'bandpass';
-      bp.frequency.setValueAtTime(baseFreq * 1.18, start);
-      bp.frequency.linearRampToValueAtTime(baseFreq * 1.32, start + duration * 0.5);
-      bp.frequency.linearRampToValueAtTime(baseFreq * 1.12, start + duration);
-      bp.Q.value = 3.4;
+      bp.frequency.setValueAtTime(baseFreq * 1.38, start);
+      bp.frequency.linearRampToValueAtTime(baseFreq * 1.56, start + duration * 0.44);
+      bp.frequency.linearRampToValueAtTime(baseFreq * 1.28, start + duration);
+      bp.Q.value = params.bandpassQ;
+
+      const warmthLp = ctx.createBiquadFilter();
+      warmthLp.type = 'lowpass';
+      warmthLp.frequency.value = 560;
+      warmthLp.Q.value = 0.8;
 
       const env = ctx.createGain();
-      const peakGain = 0.036 + Math.random() * 0.018;
-      const attack = duration * (0.36 + Math.random() * 0.12);
+      const attack = duration * params.attackRatio;
       env.gain.setValueAtTime(0.0001, start);
-      env.gain.linearRampToValueAtTime(peakGain, start + attack);
+      env.gain.linearRampToValueAtTime(params.peakGain, start + attack);
       env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
 
       const spatialCfg = this.resolveChannelSpatial(
         'hull',
         trajectory.start,
         trajectory.end,
-        1100,
+        1050,
       );
       const spatial = createSpatialBus(ctx, activityGain, {
         ...spatialCfg,
@@ -2196,35 +2233,68 @@ export class DeepSpaceEngine {
 
       const osc1 = ctx.createOscillator();
       osc1.type = 'triangle';
-      osc1.frequency.setValueAtTime(baseFreq, start);
-      osc1.frequency.linearRampToValueAtTime(baseFreq + bendDelta, start + duration);
+      scheduleUnevenBend(
+        osc1.frequency,
+        baseFreq,
+        params.bendMidDelta,
+        params.bendLateDelta,
+        params.bendEndDelta,
+        start,
+        duration,
+        1.0,
+      );
 
-      // Inharmonic metallic partial (ratio ~1.61)
+      // Layered inharmonic metallic bulkhead resonances (1.58x and 2.39x)
       const osc2 = ctx.createOscillator();
       osc2.type = 'sine';
-      osc2.frequency.setValueAtTime(baseFreq * 1.61, start);
-      osc2.frequency.linearRampToValueAtTime(baseFreq * 1.61 + bendDelta * 1.35, start + duration);
+      scheduleUnevenBend(
+        osc2.frequency,
+        baseFreq,
+        params.bendMidDelta,
+        params.bendLateDelta,
+        params.bendEndDelta,
+        start,
+        duration,
+        1.58,
+      );
 
-      // Subtle slow structural grain FM (low frequency, low depth — cold steel flex, not squeal)
+      const osc3 = ctx.createOscillator();
+      osc3.type = 'sine';
+      scheduleUnevenBend(
+        osc3.frequency,
+        baseFreq,
+        params.bendMidDelta,
+        params.bendLateDelta,
+        params.bendEndDelta,
+        start,
+        duration,
+        2.39,
+      );
+
+      // Subtle slow structural stick-slip grain FM (low rate & depth — cold steel, no squeal)
       const grainOsc = ctx.createOscillator();
       grainOsc.type = 'sine';
-      grainOsc.frequency.value = 14 + Math.random() * 9;
+      grainOsc.frequency.value = params.grainRateHz;
       const grainGain = ctx.createGain();
-      grainGain.gain.value = 2.8 + Math.random() * 2.2;
+      grainGain.gain.value = params.grainDepthHz;
       grainOsc.connect(grainGain).connect(osc1.frequency);
 
       const g2 = ctx.createGain();
-      g2.gain.value = 0.65;
+      g2.gain.value = 0.62;
+      const g3 = ctx.createGain();
+      g3.gain.value = 0.34;
 
       osc1.connect(bp);
       osc2.connect(g2).connect(bp);
-      bp.connect(env).connect(spatial.input);
+      osc3.connect(g3).connect(bp);
+      bp.connect(warmthLp).connect(env).connect(spatial.input);
 
-      let remaining = 3;
+      let remaining = 4;
       const maybeDisconnectBus = () => {
         remaining -= 1;
         if (remaining <= 0) {
           bp.disconnect();
+          warmthLp.disconnect();
           env.disconnect();
           spatial.disconnect();
         }
@@ -2239,6 +2309,11 @@ export class DeepSpaceEngine {
         g2.disconnect();
         maybeDisconnectBus();
       });
+      voices.track(osc3, () => {
+        osc3.disconnect();
+        g3.disconnect();
+        maybeDisconnectBus();
+      });
       voices.track(grainOsc, () => {
         grainOsc.disconnect();
         grainGain.disconnect();
@@ -2247,38 +2322,43 @@ export class DeepSpaceEngine {
 
       osc1.start(start);
       osc2.start(start);
+      osc3.start(start);
       grainOsc.start(start);
       osc1.stop(start + duration + 0.04);
       osc2.stop(start + duration + 0.04);
+      osc3.stop(start + duration + 0.04);
       grainOsc.stop(start + duration + 0.04);
     };
 
     /**
-     * Layer C: Uncommon deeper metallic structural stress groan with diffuse spatial echo
+     * Layer C: Deeper Metallic Structural Groan (4–9 s, 45–90 s intervals)
+     * with opposite-bulkhead sympathetic echo & optional faint secondary creak
      */
-    const spawnStructuralStressGroan = (start: number, trajectory: SpatialTrajectory) => {
-      const duration = 3.6 + Math.random() * 1.8;
-      const rootFreq = 54 + Math.random() * 24;
-      const bend = -1.6 - Math.random() * 2.4;
+    const spawnStructuralStressGroan = (
+      start: number,
+      trajectory: SpatialTrajectory,
+      params: HullGroanParams,
+      secondaryCreakParams: HullCreakParams | null,
+    ) => {
+      const { durationSec: duration, rootFreq } = params;
 
       const lp = ctx.createBiquadFilter();
       lp.type = 'lowpass';
-      lp.frequency.setValueAtTime(160, start);
-      lp.frequency.linearRampToValueAtTime(265, start + duration * 0.42);
-      lp.frequency.linearRampToValueAtTime(145, start + duration);
-      lp.Q.value = 2.2;
+      lp.frequency.setValueAtTime(140, start);
+      lp.frequency.linearRampToValueAtTime(285, start + duration * 0.42);
+      lp.frequency.linearRampToValueAtTime(135, start + duration);
+      lp.Q.value = 2.1;
 
       const env = ctx.createGain();
-      const peakGain = 0.055 + Math.random() * 0.022;
       env.gain.setValueAtTime(0.0001, start);
-      env.gain.linearRampToValueAtTime(peakGain, start + duration * 0.34);
+      env.gain.linearRampToValueAtTime(params.peakGain, start + duration * params.attackRatio);
       env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
 
       const spatialCfg = this.resolveChannelSpatial(
         'hull',
         trajectory.start,
         trajectory.end,
-        960,
+        920,
       );
       const spatial = createSpatialBus(ctx, activityGain, {
         ...spatialCfg,
@@ -2287,55 +2367,101 @@ export class DeepSpaceEngine {
         panningModel: 'HRTF',
       });
 
-      // Three heavy inharmonic steel modes (1.0, 1.59, 2.54)
+      // Four heavy inharmonic steel modes (1.0, 1.59, 2.47, 3.18)
       const m1 = ctx.createOscillator();
       m1.type = 'sine';
-      m1.frequency.setValueAtTime(rootFreq, start);
-      m1.frequency.linearRampToValueAtTime(rootFreq + bend, start + duration);
+      scheduleUnevenBend(
+        m1.frequency,
+        rootFreq,
+        params.bendMidDelta,
+        params.bendLateDelta,
+        params.bendEndDelta,
+        start,
+        duration,
+        1.0,
+      );
 
       const m2 = ctx.createOscillator();
       m2.type = 'triangle';
-      m2.frequency.setValueAtTime(rootFreq * 1.59, start);
-      m2.frequency.linearRampToValueAtTime(rootFreq * 1.59 + bend * 1.4, start + duration);
+      scheduleUnevenBend(
+        m2.frequency,
+        rootFreq,
+        params.bendMidDelta,
+        params.bendLateDelta,
+        params.bendEndDelta,
+        start,
+        duration,
+        1.59,
+      );
 
       const m3 = ctx.createOscillator();
       m3.type = 'sine';
-      m3.frequency.setValueAtTime(rootFreq * 2.54, start);
-      m3.frequency.linearRampToValueAtTime(rootFreq * 2.54 + bend * 1.9, start + duration);
+      scheduleUnevenBend(
+        m3.frequency,
+        rootFreq,
+        params.bendMidDelta,
+        params.bendLateDelta,
+        params.bendEndDelta,
+        start,
+        duration,
+        2.47,
+      );
 
-      // Distant spatial echo reflection across opposite spacecraft bulkhead
+      const m4 = ctx.createOscillator();
+      m4.type = 'sine';
+      scheduleUnevenBend(
+        m4.frequency,
+        rootFreq,
+        params.bendMidDelta,
+        params.bendLateDelta,
+        params.bendEndDelta,
+        start,
+        duration,
+        3.18,
+      );
+
+      // Distant sympathetic bulkhead reflection across opposite side of vessel
       const echo = ctx.createOscillator();
       echo.type = 'sine';
-      echo.frequency.setValueAtTime(rootFreq * 1.59, start + 0.45);
-      echo.frequency.linearRampToValueAtTime(rootFreq * 1.59 + bend, start + duration + 0.4);
+      echo.frequency.setValueAtTime(rootFreq * 1.59, start + 0.55);
+      echo.frequency.linearRampToValueAtTime(
+        (rootFreq + params.bendEndDelta) * 1.59,
+        start + duration + 0.5,
+      );
       const echoEnv = ctx.createGain();
-      echoEnv.gain.setValueAtTime(0.0001, start + 0.45);
-      echoEnv.gain.linearRampToValueAtTime(peakGain * 0.38, start + 0.45 + duration * 0.35);
-      echoEnv.gain.exponentialRampToValueAtTime(0.0001, start + duration + 0.45);
+      echoEnv.gain.setValueAtTime(0.0001, start + 0.55);
+      echoEnv.gain.linearRampToValueAtTime(
+        params.peakGain * 0.34,
+        start + 0.55 + duration * 0.36,
+      );
+      echoEnv.gain.exponentialRampToValueAtTime(0.0001, start + duration + 0.55);
       const echoPos: SpatialVec3 = {
         x: -trajectory.end.x * 0.85,
         y: trajectory.end.y * 0.7,
         z: -trajectory.end.z * 0.85,
       };
-      const echoSpatialCfg = this.resolveChannelSpatial('hull', echoPos, undefined, 850);
+      const echoSpatialCfg = this.resolveChannelSpatial('hull', echoPos, undefined, 820);
       const echoSpatial = createSpatialBus(ctx, activityGain, {
         ...echoSpatialCfg,
-        startTime: start + 0.45,
+        startTime: start + 0.55,
         panningModel: 'HRTF',
       });
 
       const g2 = ctx.createGain();
-      g2.gain.value = 0.45;
+      g2.gain.value = 0.52;
       const g3 = ctx.createGain();
-      g3.gain.value = 0.25;
+      g3.gain.value = 0.28;
+      const g4 = ctx.createGain();
+      g4.gain.value = 0.14;
 
       m1.connect(lp);
       m2.connect(g2).connect(lp);
       m3.connect(g3).connect(lp);
+      m4.connect(g4).connect(lp);
       lp.connect(env).connect(spatial.input);
       echo.connect(echoEnv).connect(echoSpatial.input);
 
-      let remaining = 4;
+      let remaining = 5;
       const maybeDisconnectBus = () => {
         remaining -= 1;
         if (remaining <= 0) {
@@ -2361,6 +2487,11 @@ export class DeepSpaceEngine {
         g3.disconnect();
         maybeDisconnectBus();
       });
+      voices.track(m4, () => {
+        m4.disconnect();
+        g4.disconnect();
+        maybeDisconnectBus();
+      });
       voices.track(echo, () => {
         echo.disconnect();
         maybeDisconnectBus();
@@ -2369,56 +2500,298 @@ export class DeepSpaceEngine {
       m1.start(start);
       m2.start(start);
       m3.start(start);
-      echo.start(start + 0.45);
+      m4.start(start);
+      echo.start(start + 0.55);
       m1.stop(start + duration + 0.04);
       m2.stop(start + duration + 0.04);
       m3.stop(start + duration + 0.04);
-      echo.stop(start + duration + 0.48);
+      m4.stop(start + duration + 0.04);
+      echo.stop(start + duration + 0.58);
+
+      // Occasionally pair a faint secondary creak from a separate hull section
+      if (secondaryCreakParams) {
+        spawnHullCreak(
+          start + params.secondaryCreakDelaySec,
+          sampleHullCreakTrajectory(Math.random() < 0.28),
+          secondaryCreakParams,
+        );
+      }
+    };
+
+    /**
+     * Layer E: Rare Heavy Hull Flex Event (7–12 s, ~3–6 min intervals)
+     * Enormous low structural mass shifting slowly across bulkheads
+     */
+    const spawnHeavyHullFlex = (
+      start: number,
+      trajectory: SpatialTrajectory,
+      params: HullHeavyFlexParams,
+    ) => {
+      const { durationSec: duration, rootFreq } = params;
+
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(115, start);
+      lp.frequency.linearRampToValueAtTime(255, start + duration * 0.44);
+      lp.frequency.linearRampToValueAtTime(105, start + duration);
+      lp.Q.value = 2.0;
+
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0.0001, start);
+      env.gain.linearRampToValueAtTime(params.peakGain, start + duration * params.attackRatio);
+      env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+      const spatialCfg = this.resolveChannelSpatial(
+        'hull',
+        trajectory.start,
+        trajectory.end,
+        880,
+      );
+      const spatial = createSpatialBus(ctx, activityGain, {
+        ...spatialCfg,
+        startTime: start,
+        durationSec: duration,
+        panningModel: 'HRTF',
+      });
+
+      // Massive inharmonic structural plate modes + slow beating pair
+      const f1 = ctx.createOscillator();
+      f1.type = 'sine';
+      scheduleUnevenBend(
+        f1.frequency,
+        rootFreq,
+        params.bendMidDelta,
+        params.bendLateDelta,
+        params.bendEndDelta,
+        start,
+        duration,
+        1.0,
+      );
+
+      const f1Pair = ctx.createOscillator();
+      f1Pair.type = 'sine';
+      scheduleUnevenBend(
+        f1Pair.frequency,
+        rootFreq + 0.32,
+        params.bendMidDelta,
+        params.bendLateDelta,
+        params.bendEndDelta,
+        start,
+        duration,
+        1.0,
+      );
+
+      const f2 = ctx.createOscillator();
+      f2.type = 'triangle';
+      scheduleUnevenBend(
+        f2.frequency,
+        rootFreq,
+        params.bendMidDelta,
+        params.bendLateDelta,
+        params.bendEndDelta,
+        start,
+        duration,
+        1.53,
+      );
+
+      const f3 = ctx.createOscillator();
+      f3.type = 'sine';
+      scheduleUnevenBend(
+        f3.frequency,
+        rootFreq,
+        params.bendMidDelta,
+        params.bendLateDelta,
+        params.bendEndDelta,
+        start,
+        duration,
+        2.31,
+      );
+
+      const f4 = ctx.createOscillator();
+      f4.type = 'sine';
+      scheduleUnevenBend(
+        f4.frequency,
+        rootFreq,
+        params.bendMidDelta,
+        params.bendLateDelta,
+        params.bendEndDelta,
+        start,
+        duration,
+        3.07,
+      );
+
+      // Opposite-bulkhead sympathetic settling response
+      const replyStart = start + 1.15;
+      const replyDur = Math.max(4.5, duration - 1.15);
+      const replyOsc = ctx.createOscillator();
+      replyOsc.type = 'sine';
+      scheduleUnevenBend(
+        replyOsc.frequency,
+        rootFreq * 1.53,
+        params.bendMidDelta * 1.2,
+        params.bendLateDelta * 1.2,
+        params.bendEndDelta * 1.2,
+        replyStart,
+        replyDur,
+        1.0,
+      );
+
+      const replyEnv = ctx.createGain();
+      replyEnv.gain.setValueAtTime(0.0001, replyStart);
+      replyEnv.gain.linearRampToValueAtTime(params.peakGain * 0.36, replyStart + replyDur * 0.35);
+      replyEnv.gain.exponentialRampToValueAtTime(0.0001, replyStart + replyDur);
+
+      const replyPos: SpatialVec3 = {
+        x: -trajectory.end.x * 0.85,
+        y: trajectory.end.y * 0.65,
+        z: -trajectory.end.z * 0.85,
+      };
+      const replySpatialCfg = this.resolveChannelSpatial('hull', replyPos, undefined, 780);
+      const replySpatial = createSpatialBus(ctx, activityGain, {
+        ...replySpatialCfg,
+        startTime: replyStart,
+        panningModel: 'HRTF',
+      });
+
+      const gPair = ctx.createGain();
+      gPair.gain.value = 0.45;
+      const g2 = ctx.createGain();
+      g2.gain.value = 0.54;
+      const g3 = ctx.createGain();
+      g3.gain.value = 0.28;
+      const g4 = ctx.createGain();
+      g4.gain.value = 0.16;
+
+      f1.connect(lp);
+      f1Pair.connect(gPair).connect(lp);
+      f2.connect(g2).connect(lp);
+      f3.connect(g3).connect(lp);
+      f4.connect(g4).connect(lp);
+      lp.connect(env).connect(spatial.input);
+      replyOsc.connect(replyEnv).connect(replySpatial.input);
+
+      let remaining = 6;
+      const maybeDisconnectBus = () => {
+        remaining -= 1;
+        if (remaining <= 0) {
+          lp.disconnect();
+          env.disconnect();
+          spatial.disconnect();
+          replyEnv.disconnect();
+          replySpatial.disconnect();
+        }
+      };
+
+      voices.track(f1, () => {
+        f1.disconnect();
+        maybeDisconnectBus();
+      });
+      voices.track(f1Pair, () => {
+        f1Pair.disconnect();
+        gPair.disconnect();
+        maybeDisconnectBus();
+      });
+      voices.track(f2, () => {
+        f2.disconnect();
+        g2.disconnect();
+        maybeDisconnectBus();
+      });
+      voices.track(f3, () => {
+        f3.disconnect();
+        g3.disconnect();
+        maybeDisconnectBus();
+      });
+      voices.track(f4, () => {
+        f4.disconnect();
+        g4.disconnect();
+        maybeDisconnectBus();
+      });
+      voices.track(replyOsc, () => {
+        replyOsc.disconnect();
+        maybeDisconnectBus();
+      });
+
+      f1.start(start);
+      f1Pair.start(start);
+      f2.start(start);
+      f3.start(start);
+      f4.start(start);
+      replyOsc.start(replyStart);
+
+      f1.stop(start + duration + 0.04);
+      f1Pair.stop(start + duration + 0.04);
+      f2.stop(start + duration + 0.04);
+      f3.stop(start + duration + 0.04);
+      f4.stop(start + duration + 0.04);
+      replyOsc.stop(replyStart + replyDur + 0.04);
     };
 
     const scheduleHullActivity = () => {
-      if (!running || this.disposed || this.ctx !== ctx) return;
+      if (!running || this.disposed || this.ctx !== ctx || !scheduleState) return;
 
       if (typeof document !== 'undefined' && document.hidden) {
         timerId = null;
         return;
       }
 
-      let nextDelayMs = 8500 + Math.random() * 11000;
+      const nowMs = Date.now();
 
       if (ctx.state === 'running') {
-        const now = ctx.currentTime;
-        cycleCount += 1;
-        const roll = Math.random();
+        const step = evaluateHullScheduleStep(scheduleState, nowMs);
+        scheduleState = step.nextSchedule;
+        const audioNow = ctx.currentTime;
 
-        if (cycleCount % 4 === 0 || roll < 0.25) {
-          // Uncommon deeper structural stress groan
-          spawnStructuralStressGroan(now, sampleHullSurroundingTrajectory(Math.random() < 0.35));
-          nextDelayMs = 13_500 + Math.random() * 14_500;
-        } else if (roll < 0.68) {
-          // Infrequent resonant hull flex / creak
-          spawnHullCreak(now, sampleHullSurroundingTrajectory(Math.random() < 0.32));
-          nextDelayMs = 9_500 + Math.random() * 12_500;
-        } else {
-          // Quiet structural rest interval so sounds never feel repetitive
-          nextDelayMs = 11_000 + Math.random() * 13_000;
+        if (step.kind === 'heavy-flex') {
+          spawnHeavyHullFlex(audioNow, sampleHullHeavyFlexTrajectory(), step.params);
+        } else if (step.kind === 'groan') {
+          spawnStructuralStressGroan(
+            audioNow,
+            sampleHullGroanTrajectory(Math.random() < 0.35),
+            step.params,
+            step.secondaryCreakParams,
+          );
+        } else if (step.kind === 'creak') {
+          spawnHullCreak(
+            audioNow,
+            sampleHullCreakTrajectory(Math.random() < 0.3),
+            step.params,
+          );
         }
       }
 
-      timerId = window.setTimeout(scheduleHullActivity, nextDelayMs);
+      const delayMs = getNextHullWakeDelayMs(scheduleState, Date.now());
+      timerId = window.setTimeout(scheduleHullActivity, delayMs);
     };
 
     const start = () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
       if (running && timerId !== null) return;
       running = true;
       smoothSetParam(activityGain.gain, 1, ctx.currentTime, 0.06);
       clearTimer();
-      timerId = window.setTimeout(scheduleHullActivity, 2400 + Math.random() * 2600);
+      const nowMs = Date.now();
+      scheduleState =
+        scheduleState === null
+          ? createInitialHullSchedule(nowMs)
+          : reanchorHullScheduleAfterResume(scheduleState, nowMs);
+      timerId = window.setTimeout(scheduleHullActivity, getNextHullWakeDelayMs(scheduleState, nowMs));
+    };
+
+    const pause = () => {
+      if (!running && timerId === null) return;
+      running = false;
+      clearTimer();
+      const now = ctx.currentTime;
+      activityGain.gain.cancelScheduledValues(now);
+      activityGain.gain.setValueAtTime(activityGain.gain.value, now);
+      activityGain.gain.linearRampToValueAtTime(0, now + 0.03);
+      voices.stopAll(now, ctx.state !== 'running');
     };
 
     const stop = () => {
       if (!running && timerId === null) return;
       running = false;
+      scheduleState = null;
       clearTimer();
       const now = ctx.currentTime;
       activityGain.gain.cancelScheduledValues(now);
@@ -2433,9 +2806,11 @@ export class DeepSpaceEngine {
       analyser,
       applyProfile,
       start,
+      pause,
       stop,
       cleanup: () => {
         running = false;
+        scheduleState = null;
         clearTimer();
         voices.stopAll(ctx.currentTime, true);
         for (const src of [

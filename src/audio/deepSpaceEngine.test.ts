@@ -398,3 +398,123 @@ test('switching acoustic profiles does not interfere with Ambient Events schedul
     restore();
   }
 });
+
+test('CH-06 hull creaks & groans run when CH-06 is enabled with Ambient Events OFF, stop immediately on disable/Stop All, and pause when backgrounded', async () => {
+  const prevWindow = (globalThis as Record<string, unknown>).window;
+  const prevDoc = (globalThis as Record<string, unknown>).document;
+  const prevDateNow = Date.now;
+
+  let fakeNowMs = 1_000_000;
+  Date.now = () => fakeNowMs;
+
+  let nextTimerId = 1;
+  const timers = new Map<number, { fn: () => void; delay: number }>();
+  const clearedIds: number[] = [];
+  const docListeners: Record<string, Array<() => void>> = {};
+  const mockDoc = {
+    hidden: false,
+    addEventListener: (ev: string, cb: () => void) => {
+      docListeners[ev] = docListeners[ev] ?? [];
+      docListeners[ev].push(cb);
+    },
+    removeEventListener: (ev: string, cb: () => void) => {
+      docListeners[ev] = (docListeners[ev] ?? []).filter((fn) => fn !== cb);
+    },
+  };
+
+  MockAudioContext.instances = [];
+  (globalThis as Record<string, unknown>).document = mockDoc;
+  (globalThis as Record<string, unknown>).window = {
+    AudioContext: MockAudioContext,
+    location: { search: '' },
+    setTimeout: (fn: () => void, delay = 0) => {
+      const id = nextTimerId++;
+      timers.set(id, { fn, delay });
+      return id;
+    },
+    clearTimeout: (id: number) => {
+      clearedIds.push(id);
+      timers.delete(id);
+    },
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  };
+
+  const triggeredEvents: unknown[] = [];
+  const engine = new DeepSpaceEngine({
+    onAmbientEvent: (ev) => triggeredEvents.push(ev),
+  });
+
+  try {
+    let state = createInitialMixerState();
+    assert.equal(state.ambientEventsEnabled, false);
+
+    // Enable ONLY CH-06 Hull while Ambient Events remain OFF
+    engine.unlockFromGesture();
+    state = mixerReducer(state, { type: 'TOGGLE_CHANNEL', channelId: 'hull' });
+    await engine.syncState(state);
+
+    const ctx = MockAudioContext.instances[0];
+    assert.equal(ctx.panners.length, 6);
+    assert.equal(timers.size, 1, 'Expected one active CH-06 hull scheduler timer');
+
+    const [firstTimerId, firstTimer] = [...timers.entries()][0];
+    const initialNodeCount = ctx.nodes.length;
+
+    // Advance fake clock past initial creak delay and fire timer
+    fakeNowMs += firstTimer.delay + 50;
+    timers.delete(firstTimerId);
+    firstTimer.fn();
+
+    // Creak spawned transient oscillators + HRTF panner with Ambient Events completely OFF
+    assert.ok(ctx.nodes.length > initialNodeCount, 'Expected CH-06 creak nodes to be created');
+    assert.ok(ctx.panners.length > 6, 'Expected spatialized creak PannerNode');
+    assert.equal(triggeredEvents.length, 0);
+    assert.equal(timers.size, 1, 'Expected next CH-06 wakeup timer to be scheduled');
+
+    const transientNodes = ctx.nodes.slice(initialNodeCount);
+
+    // Backgrounding the tab must clear pending timer and stop active transient voices
+    mockDoc.hidden = true;
+    for (const cb of docListeners.visibilitychange ?? []) cb();
+    assert.equal(timers.size, 0, 'Expected pending CH-06 timer cleared when tab hidden');
+    for (const node of transientNodes) {
+      if (node instanceof MockOscillatorNode) {
+        assert.equal(node.stopped, true);
+      }
+    }
+
+    // Returning to tab re-schedules CH-06 cleanly without firing an immediate burst
+    mockDoc.hidden = false;
+    fakeNowMs += 120_000;
+    for (const cb of docListeners.visibilitychange ?? []) cb();
+    assert.equal(timers.size, 1, 'Expected CH-06 timer re-scheduled on visibility return');
+    const [resumedId, resumedTimer] = [...timers.entries()][0];
+    assert.ok(resumedTimer.delay >= 1_000, 'Expected re-anchored delay instead of immediate burst');
+
+    // Turning CH-06 OFF clears its pending timer immediately (only 60ms AudioContext suspend timer may exist)
+    state = mixerReducer(state, { type: 'TOGGLE_CHANNEL', channelId: 'hull' });
+    await engine.syncState(state);
+    assert.equal(timers.has(resumedId), false, 'Expected CH-06 timer cleared immediately on channel disable');
+    assert.equal(
+      [...timers.values()].every((t) => t.delay === 60),
+      true,
+      'Only 60ms AudioContext suspend timer may remain after last channel disables',
+    );
+    assert.ok(clearedIds.includes(resumedId));
+  } finally {
+    engine.dispose();
+    Date.now = prevDateNow;
+    if (prevWindow === undefined) {
+      delete (globalThis as Record<string, unknown>).window;
+    } else {
+      (globalThis as Record<string, unknown>).window = prevWindow;
+    }
+    if (prevDoc === undefined) {
+      delete (globalThis as Record<string, unknown>).document;
+    } else {
+      (globalThis as Record<string, unknown>).document = prevDoc;
+    }
+  }
+});
+

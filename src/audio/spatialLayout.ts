@@ -213,3 +213,92 @@ export function sampleHullSurroundingTrajectory(
     },
   };
 }
+
+/**
+ * Nearby 360-degree hull section coordinates for ordinary CH-06 metallic creaks.
+ */
+export function sampleHullCreakTrajectory(
+  allowMovement: boolean,
+  randomFn: () => number = Math.random,
+): SpatialTrajectory {
+  const angle = randomFn() * Math.PI * 2;
+  const radius = 1.8 + randomFn() * 1.6; // 1.8m .. 3.4m (closer bulkhead/frame sections)
+  const start: SpatialVec3 = {
+    x: Math.cos(angle) * radius,
+    y: -0.9 + randomFn() * 3.1,
+    z: Math.sin(angle) * radius,
+  };
+
+  if (!allowMovement) {
+    return { start, end: { ...start } };
+  }
+
+  const shiftAngle = angle + (randomFn() - 0.5) * 0.22;
+  const shiftRadius = Math.max(1.6, Math.min(3.8, radius + (randomFn() - 0.5) * 0.45));
+  return {
+    start,
+    end: {
+      x: Math.cos(shiftAngle) * shiftRadius,
+      y: start.y + (randomFn() - 0.5) * 0.3,
+      z: Math.sin(shiftAngle) * shiftRadius,
+    },
+  };
+}
+
+/**
+ * Larger, more distant hull section coordinates for CH-06 structural groans.
+ */
+export function sampleHullGroanTrajectory(
+  allowMovement: boolean,
+  randomFn: () => number = Math.random,
+): SpatialTrajectory {
+  const angle = randomFn() * Math.PI * 2;
+  const radius = 3.6 + randomFn() * 2.2; // 3.6m .. 5.8m (larger, more distant hull ribs)
+  const start: SpatialVec3 = {
+    x: Math.cos(angle) * radius,
+    y: -1.4 + randomFn() * 3.8,
+    z: Math.sin(angle) * radius,
+  };
+
+  if (!allowMovement) {
+    return { start, end: { ...start } };
+  }
+
+  const shiftAngle = angle + (randomFn() - 0.5) * 0.28;
+  const shiftRadius = Math.max(3.2, Math.min(6.4, radius + (randomFn() - 0.5) * 0.7));
+  return {
+    start,
+    end: {
+      x: Math.cos(shiftAngle) * shiftRadius,
+      y: start.y + (randomFn() - 0.5) * 0.4,
+      z: Math.sin(shiftAngle) * shiftRadius,
+    },
+  };
+}
+
+/**
+ * Subtle large-scale spatial shift across hull sections for rare CH-06 heavy flex events.
+ */
+export function sampleHullHeavyFlexTrajectory(
+  randomFn: () => number = Math.random,
+): SpatialTrajectory {
+  const angle = randomFn() * Math.PI * 2;
+  const radius = 3.2 + randomFn() * 2.2;
+  const start: SpatialVec3 = {
+    x: Math.cos(angle) * radius,
+    y: -1.2 + randomFn() * 3.0,
+    z: Math.sin(angle) * radius,
+  };
+
+  const direction = randomFn() < 0.5 ? -1 : 1;
+  const shiftAngle = angle + direction * (0.2 + randomFn() * 0.24);
+  const shiftRadius = Math.max(2.8, Math.min(6.2, radius + (randomFn() - 0.5) * 0.9));
+  return {
+    start,
+    end: {
+      x: Math.cos(shiftAngle) * shiftRadius,
+      y: start.y + (randomFn() - 0.5) * 0.55,
+      z: Math.sin(shiftAngle) * shiftRadius,
+    },
+  };
+}

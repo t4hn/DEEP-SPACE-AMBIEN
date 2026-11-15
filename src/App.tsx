@@ -269,7 +269,7 @@ export default function App() {
           />
         </div>
 
-        {/* Five Independent Audio Channels */}
+        {/* Six Independent Audio Channels */}
         <section aria-label="Audio Channels" className="flex flex-col gap-2">
           {CHANNELS.map((ch) => (
             <ChannelStrip
