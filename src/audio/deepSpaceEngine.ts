@@ -117,12 +117,16 @@ class TransientVoicePool {
     };
   }
 
-  public stopAll(now: number): void {
+  public stopAll(now: number, immediate = false): void {
     for (const voice of this.voices) {
-      voice.stop(now + 0.03);
-      voice.disconnect();
+      voice.stop(immediate ? now : now + 0.035);
+      if (immediate) {
+        voice.disconnect();
+      }
     }
-    this.voices.clear();
+    if (immediate) {
+      this.voices.clear();
+    }
   }
 }
 
@@ -563,128 +567,313 @@ export class DeepSpaceEngine {
   }
 
   /**
-   * CH-04: Systems — Subtle, intermittent electronic activity
+   * CH-04: Systems — Layered spacecraft computer environment:
+   * A. Background Processing (continuous subtle electronic hum + modulated bus texture)
+   * B. Telemetry Activity (varied short electronic pulses & confirmation pairs)
+   * C. Machinery Relays (muted damped electro-mechanical switching clicks/ticks)
+   * D. Diagnostic Sequences (coherent multi-note system check routines)
    */
   private buildSystemsChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
     const { input, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
 
-    // Warm lowpass on the systems bus prevents any piercing digital edges
+    // Master lowpass keeps all computational activity warm and non-fatiguing
     const busToneFilter = ctx.createBiquadFilter();
     busToneFilter.type = 'lowpass';
-    busToneFilter.frequency.value = 1400;
-    busToneFilter.Q.value = 0.6;
+    busToneFilter.frequency.value = 1280;
+    busToneFilter.Q.value = 0.65;
     busToneFilter.connect(input);
 
-    // Quiet console electronics whisper bed
-    const humOsc = ctx.createOscillator();
-    humOsc.type = 'sine';
-    humOsc.frequency.value = 180;
-    const humGain = ctx.createGain();
-    humGain.gain.value = 0.008;
-    humOsc.connect(humGain).connect(busToneFilter);
-    humOsc.start();
+    // Sub-gate for transient voices so disabling Systems fades out smoothly with zero clicks
+    const activityGain = ctx.createGain();
+    activityGain.gain.value = 0;
+    activityGain.connect(busToneFilter);
 
-    // Calm, restrained harmonic register for non-fatiguing extended listening
-    const scale = [392.0, 440.0, 523.25, 587.33, 659.25, 783.99];
+    // --- Layer A: Background Processing (continuous electronic computing texture) ---
+    const procFilter = ctx.createBiquadFilter();
+    procFilter.type = 'bandpass';
+    procFilter.frequency.value = 310;
+    procFilter.Q.value = 0.9;
+    procFilter.connect(busToneFilter);
+
+    const procGain = ctx.createGain();
+    procGain.gain.value = 0.032;
+    procGain.connect(procFilter);
+
+    // Soft dual-harmonic solid-state hum (216 Hz root + 324 Hz fifth + 432 Hz octave)
+    const hum1 = ctx.createOscillator();
+    hum1.type = 'sine';
+    hum1.frequency.value = 216;
+    const hum1Gain = ctx.createGain();
+    hum1Gain.gain.value = 0.55;
+    hum1.connect(hum1Gain).connect(procGain);
+
+    const hum2 = ctx.createOscillator();
+    hum2.type = 'sine';
+    hum2.frequency.value = 324;
+    const hum2Gain = ctx.createGain();
+    hum2Gain.gain.value = 0.28;
+    hum2.connect(hum2Gain).connect(procGain);
+
+    const hum3 = ctx.createOscillator();
+    hum3.type = 'sine';
+    hum3.frequency.value = 432;
+    const hum3Gain = ctx.createGain();
+    hum3Gain.gain.value = 0.14;
+    hum3.connect(hum3Gain).connect(procGain);
+
+    // Subtle incommensurate modulation for gentle electronic shimmer
+    const procFilterLfo = ctx.createOscillator();
+    procFilterLfo.type = 'sine';
+    procFilterLfo.frequency.value = 0.11;
+    const procFilterLfoGain = ctx.createGain();
+    procFilterLfoGain.gain.value = 55;
+    procFilterLfo.connect(procFilterLfoGain).connect(procFilter.frequency);
+
+    const procAmpLfo = ctx.createOscillator();
+    procAmpLfo.type = 'sine';
+    procAmpLfo.frequency.value = 0.17;
+    const procAmpLfoGain = ctx.createGain();
+    procAmpLfoGain.gain.value = 0.008;
+    procAmpLfo.connect(procAmpLfoGain).connect(procGain.gain);
+
+    // Subtle continuous data-bus whisper bed (narrow-band modulated pink noise)
+    const busNoiseBuf = createSeamlessNoiseBuffer(ctx, 4.7, 'pink');
+    const busNoiseSrc = ctx.createBufferSource();
+    busNoiseSrc.buffer = busNoiseBuf;
+    busNoiseSrc.loop = true;
+
+    const busNoiseBp = ctx.createBiquadFilter();
+    busNoiseBp.type = 'bandpass';
+    busNoiseBp.frequency.value = 560;
+    busNoiseBp.Q.value = 2.8;
+
+    const busNoiseGain = ctx.createGain();
+    busNoiseGain.gain.value = 0.022;
+    busNoiseSrc.connect(busNoiseBp).connect(busNoiseGain).connect(busToneFilter);
+
+    const busNoiseLfo = ctx.createOscillator();
+    busNoiseLfo.type = 'sine';
+    busNoiseLfo.frequency.value = 0.43;
+    const busNoiseLfoGain = ctx.createGain();
+    busNoiseLfoGain.gain.value = 0.011;
+    busNoiseLfo.connect(busNoiseLfoGain).connect(busNoiseGain.gain);
+
+    hum1.start();
+    hum2.start();
+    hum3.start();
+    procFilterLfo.start();
+    procAmpLfo.start();
+    busNoiseSrc.start();
+    busNoiseLfo.start();
+
+    // --- Reusable damped relay impulse buffer for Layer C (Machinery Relays) ---
+    const relayLength = Math.floor(ctx.sampleRate * 0.032);
+    const relayBuf = ctx.createBuffer(1, relayLength, ctx.sampleRate);
+    const relayData = relayBuf.getChannelData(0);
+    for (let i = 0; i < relayLength; i += 1) {
+      const t = i / relayLength;
+      // Fast soft transient envelope without harsh peak spike
+      const env = Math.sin(Math.min(1, t * 14) * Math.PI * 0.5) * Math.exp(-t * 9.5);
+      relayData[i] = (Math.random() * 2 - 1) * env;
+    }
+
+    // Coherent telemetry pitch family (G4, A4, B4, D5, E5, G5)
+    const scale = [392.0, 440.0, 493.88, 587.33, 659.25, 783.99];
+    // Structured diagnostic phrase contours (scale indices)
+    const diagnosticContours = [
+      [0, 2, 3, 5],
+      [4, 2, 3, 1, 2],
+      [0, 3, 5, 3],
+      [1, 3, 4, 2],
+    ];
+
     const voices = new TransientVoicePool();
     let timerId: number | null = null;
     let running = false;
+    let eventCounter = 0;
+    let lastContourIdx = -1;
 
     const clearTimer = () => {
       if (timerId !== null) {
         window.clearTimeout(timerId);
         timerId = null;
       }
+    };
+
+    const spawnTone = (
+      start: number,
+      freq: number,
+      duration: number,
+      peakGain: number,
+      panVal: number,
+      harmonicBlend = 0,
+    ) => {
+      const osc = ctx.createOscillator();
+      const env = ctx.createGain();
+      const pan = ctx.createStereoPanner();
+
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      pan.pan.value = panVal;
+
+      env.gain.setValueAtTime(0.0001, start);
+      env.gain.linearRampToValueAtTime(peakGain, start + 0.012);
+      env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+      osc.connect(env).connect(pan).connect(activityGain);
+      voices.track(osc, () => {
+        osc.disconnect();
+        env.disconnect();
+        pan.disconnect();
+      });
+      osc.start(start);
+      osc.stop(start + duration + 0.025);
+
+      if (harmonicBlend > 0) {
+        const sub = ctx.createOscillator();
+        const subEnv = ctx.createGain();
+        sub.type = 'triangle';
+        sub.frequency.value = freq * 0.5;
+        subEnv.gain.setValueAtTime(0.0001, start);
+        subEnv.gain.linearRampToValueAtTime(peakGain * harmonicBlend, start + 0.015);
+        subEnv.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+        sub.connect(subEnv).connect(pan);
+        voices.track(sub, () => {
+          sub.disconnect();
+          subEnv.disconnect();
+        });
+        sub.start(start);
+        sub.stop(start + duration + 0.025);
+      }
+    };
+
+    const spawnRelayTick = (start: number, centerFreq: number, peakGain: number, panVal: number) => {
+      const src = ctx.createBufferSource();
+      src.buffer = relayBuf;
+
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = centerFreq;
+      bp.Q.value = 2.4;
+
+      const env = ctx.createGain();
+      env.gain.value = peakGain;
+
+      const pan = ctx.createStereoPanner();
+      pan.pan.value = panVal;
+
+      src.connect(bp).connect(env).connect(pan).connect(activityGain);
+      voices.track(src, () => {
+        src.disconnect();
+        bp.disconnect();
+        env.disconnect();
+        pan.disconnect();
+      });
+      src.start(start);
+      src.stop(start + 0.036);
     };
 
     const scheduleNextEvent = () => {
       if (!running || this.disposed || this.ctx !== ctx) return;
 
-      // Avoid queuing events while tab is backgrounded
+      // Pause scheduling cleanly while backgrounded; visibilitychange restarts it on return
       if (typeof document !== 'undefined' && document.hidden) {
-        timerId = window.setTimeout(scheduleNextEvent, 1500);
+        timerId = null;
         return;
       }
 
+      let nextDelayMs = 1900 + Math.random() * 2100;
+
       if (ctx.state === 'running') {
         const now = ctx.currentTime;
-        const roll = Math.random();
+        eventCounter += 1;
 
-        if (roll < 0.58) {
-          // Soft single or quiet two-step telemetry tone
-          const steps = Math.random() < 0.4 ? 2 : 1;
-          const baseIdx = Math.floor(Math.random() * scale.length);
-          for (let i = 0; i < steps; i += 1) {
-            const start = now + i * 0.18;
-            const freq = scale[(baseIdx + i * 2) % scale.length];
-            const osc = ctx.createOscillator();
-            const env = ctx.createGain();
-            const pan = ctx.createStereoPanner();
-
-            osc.type = 'sine';
-            osc.frequency.value = freq;
-            pan.pan.value = (Math.random() - 0.5) * 0.42;
-
-            env.gain.setValueAtTime(0.0001, start);
-            env.gain.linearRampToValueAtTime(0.065, start + 0.018);
-            env.gain.exponentialRampToValueAtTime(0.0001, start + 0.21);
-
-            osc.connect(env).connect(pan).connect(busToneFilter);
-            voices.track(osc, () => {
-              osc.disconnect();
-              env.disconnect();
-              pan.disconnect();
-            });
-            osc.start(start);
-            osc.stop(start + 0.24);
+        // Layer D: Intentional diagnostic sequence every ~5-6 cycles (~12-18s)
+        if (eventCounter % 5 === 0) {
+          let contourIdx = Math.floor(Math.random() * diagnosticContours.length);
+          if (contourIdx === lastContourIdx) {
+            contourIdx = (contourIdx + 1) % diagnosticContours.length;
           }
+          lastContourIdx = contourIdx;
+          const contour = diagnosticContours[contourIdx];
+          const stepSec = 0.145 + Math.random() * 0.03;
+          const transpose = Math.random() < 0.5 ? 1 : 0.8909; // G4 or F4 root center
+          const panVal = (Math.random() - 0.5) * 0.28;
+
+          for (let i = 0; i < contour.length; i += 1) {
+            const isFinal = i === contour.length - 1;
+            const freq = scale[contour[i]] * transpose;
+            spawnTone(
+              now + i * stepSec,
+              freq,
+              isFinal ? 0.24 : 0.14,
+              isFinal ? 0.056 : 0.044,
+              panVal,
+              0.22,
+            );
+          }
+          nextDelayMs = 2800 + Math.random() * 2200;
         } else {
-          // Muffled processing micro-burst (3-4 gentle muted pulses)
-          const count = 3 + Math.floor(Math.random() * 2);
-          const baseFreq = scale[Math.floor(Math.random() * 4)];
-          const panVal = (Math.random() - 0.5) * 0.5;
-          for (let i = 0; i < count; i += 1) {
-            const start = now + i * (0.068 + Math.random() * 0.02);
-            const osc = ctx.createOscillator();
-            const env = ctx.createGain();
-            const pan = ctx.createStereoPanner();
+          const roll = Math.random();
 
-            osc.type = 'sine';
-            osc.frequency.value = baseFreq * (1 + (i % 3) * 0.125);
-            pan.pan.value = panVal;
-
-            env.gain.setValueAtTime(0.0001, start);
-            env.gain.linearRampToValueAtTime(0.038, start + 0.008);
-            env.gain.exponentialRampToValueAtTime(0.0001, start + 0.055);
-
-            osc.connect(env).connect(pan).connect(busToneFilter);
-            voices.track(osc, () => {
-              osc.disconnect();
-              env.disconnect();
-              pan.disconnect();
-            });
-            osc.start(start);
-            osc.stop(start + 0.065);
+          if (roll < 0.46) {
+            // Layer B: Telemetry pulse / confirmation pair or register burst
+            if (Math.random() < 0.65) {
+              const baseIdx = Math.floor(Math.random() * scale.length);
+              const secondIdx = (baseIdx + (Math.random() < 0.6 ? 2 : 1)) % scale.length;
+              const panVal = (Math.random() - 0.5) * 0.42;
+              spawnTone(now, scale[baseIdx], 0.09, 0.052, panVal);
+              spawnTone(now + 0.115 + Math.random() * 0.03, scale[secondIdx], 0.13, 0.048, panVal);
+            } else {
+              // Quiet 3-4 step data register check
+              const count = 3 + Math.floor(Math.random() * 2);
+              const baseIdx = Math.floor(Math.random() * 4);
+              const panVal = (Math.random() - 0.5) * 0.45;
+              for (let i = 0; i < count; i += 1) {
+                const start = now + i * (0.072 + Math.random() * 0.015);
+                const freq = scale[(baseIdx + i) % scale.length];
+                spawnTone(start, freq, 0.065, 0.036, panVal);
+              }
+            }
+          } else if (roll < 0.8) {
+            // Layer C: Muted machinery relay switching (single tick or latch/release pair)
+            const panVal = (Math.random() - 0.5) * 0.55;
+            const baseFreq = 430 + Math.random() * 280;
+            spawnRelayTick(now, baseFreq, 0.075, panVal);
+            if (Math.random() < 0.58) {
+              const releaseOffset = 0.068 + Math.random() * 0.045;
+              spawnRelayTick(now + releaseOffset, baseFreq + (Math.random() < 0.5 ? 110 : -85), 0.055, panVal);
+            }
+          } else {
+            // Combined relay switch followed immediately by telemetry confirmation pulse
+            const panVal = (Math.random() - 0.5) * 0.4;
+            spawnRelayTick(now, 490 + Math.random() * 180, 0.065, panVal);
+            const toneFreq = scale[Math.floor(Math.random() * scale.length)];
+            spawnTone(now + 0.085, toneFreq, 0.11, 0.045, panVal);
           }
         }
       }
 
-      const nextDelayMs = 2600 + Math.random() * 5200;
       timerId = window.setTimeout(scheduleNextEvent, nextDelayMs);
     };
 
     const start = () => {
-      if (running) return;
+      if (running && timerId !== null) return;
       running = true;
+      smoothSetParam(activityGain.gain, 1, ctx.currentTime, 0.035);
       clearTimer();
-      timerId = window.setTimeout(scheduleNextEvent, 450);
+      timerId = window.setTimeout(scheduleNextEvent, 320);
     };
 
     const stop = () => {
       if (!running && timerId === null) return;
       running = false;
       clearTimer();
-      voices.stopAll(ctx.currentTime);
+      const now = ctx.currentTime;
+      activityGain.gain.cancelScheduledValues(now);
+      activityGain.gain.setValueAtTime(activityGain.gain.value, now);
+      activityGain.gain.linearRampToValueAtTime(0, now + 0.025);
+      voices.stopAll(now, ctx.state !== 'running');
     };
 
     return {
@@ -693,168 +882,10 @@ export class DeepSpaceEngine {
       start,
       stop,
       cleanup: () => {
-        stop();
-        try {
-          humOsc.stop();
-        } catch {
-          // Ignore already stopped
-        }
-        humOsc.disconnect();
-        humGain.disconnect();
-        busToneFilter.disconnect();
-        disconnectBus();
-      },
-    };
-  }
-
-  /**
-   * CH-05: Communications — Atmospheric radio static and occasional distant signals
-   */
-  private buildCommunicationsChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
-    const { input, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
-
-    // Pink noise base produces warm receiver hiss rather than harsh white static
-    const staticFilter = ctx.createBiquadFilter();
-    staticFilter.type = 'bandpass';
-    staticFilter.frequency.value = 980;
-    staticFilter.Q.value = 1.1;
-
-    const staticLowpass = ctx.createBiquadFilter();
-    staticLowpass.type = 'lowpass';
-    staticLowpass.frequency.value = 1850;
-    staticLowpass.Q.value = 0.6;
-
-    staticFilter.connect(staticLowpass).connect(input);
-
-    const staticBuf = createSeamlessNoiseBuffer(ctx, 15.7, 'pink');
-    const staticSrc = ctx.createBufferSource();
-    staticSrc.buffer = staticBuf;
-    staticSrc.loop = true;
-    const staticGain = ctx.createGain();
-    staticGain.gain.value = 0.14;
-    staticSrc.connect(staticGain).connect(staticFilter);
-
-    // Slow ionospheric band drift
-    const driftLfo = ctx.createOscillator();
-    driftLfo.type = 'sine';
-    driftLfo.frequency.value = 0.065;
-    const driftGain = ctx.createGain();
-    driftGain.gain.value = 210;
-    driftLfo.connect(driftGain).connect(staticFilter.frequency);
-
-    staticSrc.start();
-    driftLfo.start();
-
-    const voices = new TransientVoicePool();
-    let timerId: number | null = null;
-    let running = false;
-
-    const clearTimer = () => {
-      if (timerId !== null) {
-        window.clearTimeout(timerId);
-        timerId = null;
-      }
-    };
-
-    const scheduleSignal = () => {
-      if (!running || this.disposed || this.ctx !== ctx) return;
-
-      if (typeof document !== 'undefined' && document.hidden) {
-        timerId = window.setTimeout(scheduleSignal, 1500);
-        return;
-      }
-
-      if (ctx.state === 'running') {
-        const now = ctx.currentTime;
-        const pan = ctx.createStereoPanner();
-        pan.pan.value = (Math.random() - 0.5) * 0.65;
-        pan.connect(input);
-
-        if (Math.random() < 0.6) {
-          // Distant narrow-band carrier sweep / subspace beacon
-          const osc = ctx.createOscillator();
-          const bp = ctx.createBiquadFilter();
-          const env = ctx.createGain();
-
-          const startFreq = 560 + Math.random() * 620;
-          const endFreq = startFreq + (Math.random() - 0.5) * 90;
-          const duration = 0.9 + Math.random() * 1.5;
-
-          osc.type = 'sine';
-          osc.frequency.setValueAtTime(startFreq, now);
-          osc.frequency.linearRampToValueAtTime(endFreq, now + duration);
-
-          bp.type = 'bandpass';
-          bp.frequency.value = startFreq;
-          bp.Q.value = 5.5;
-
-          env.gain.setValueAtTime(0.0001, now);
-          env.gain.linearRampToValueAtTime(0.036, now + duration * 0.4);
-          env.gain.exponentialRampToValueAtTime(0.0001, now + duration);
-
-          osc.connect(bp).connect(env).connect(pan);
-          voices.track(osc, () => {
-            osc.disconnect();
-            bp.disconnect();
-            env.disconnect();
-            pan.disconnect();
-          });
-          osc.start(now);
-          osc.stop(now + duration + 0.05);
-        } else {
-          // Soft atmospheric squelch swell (pink noise, smooth attack)
-          const burst = ctx.createBufferSource();
-          burst.buffer = staticBuf;
-          burst.loop = true;
-          const bp = ctx.createBiquadFilter();
-          bp.type = 'bandpass';
-          bp.frequency.value = 920 + Math.random() * 520;
-          bp.Q.value = 1.9;
-          const env = ctx.createGain();
-          const duration = 0.55 + Math.random() * 0.65;
-
-          env.gain.setValueAtTime(0.0001, now);
-          env.gain.linearRampToValueAtTime(0.11, now + 0.14);
-          env.gain.exponentialRampToValueAtTime(0.0001, now + duration);
-
-          burst.connect(bp).connect(env).connect(pan);
-          voices.track(burst, () => {
-            burst.disconnect();
-            bp.disconnect();
-            env.disconnect();
-            pan.disconnect();
-          });
-          burst.start(now, Math.random() * 10);
-          burst.stop(now + duration + 0.05);
-        }
-      }
-
-      const nextDelayMs = 3600 + Math.random() * 6800;
-      timerId = window.setTimeout(scheduleSignal, nextDelayMs);
-    };
-
-    const start = () => {
-      if (running) return;
-      running = true;
-      clearTimer();
-      timerId = window.setTimeout(scheduleSignal, 700);
-    };
-
-    const stop = () => {
-      if (!running && timerId === null) return;
-      running = false;
-      clearTimer();
-      voices.stopAll(ctx.currentTime);
-    };
-
-    return {
-      gain: outputGain,
-      analyser,
-      start,
-      stop,
-      cleanup: () => {
-        stop();
-        for (const src of [staticSrc, driftLfo]) {
+        running = false;
+        clearTimer();
+        voices.stopAll(ctx.currentTime, true);
+        for (const src of [hum1, hum2, hum3, procFilterLfo, procAmpLfo, busNoiseSrc, busNoiseLfo]) {
           try {
             src.stop();
           } catch {
@@ -862,10 +893,369 @@ export class DeepSpaceEngine {
           }
           src.disconnect();
         }
-        staticGain.disconnect();
-        driftGain.disconnect();
-        staticFilter.disconnect();
-        staticLowpass.disconnect();
+        hum1Gain.disconnect();
+        hum2Gain.disconnect();
+        hum3Gain.disconnect();
+        procGain.disconnect();
+        procFilter.disconnect();
+        procFilterLfoGain.disconnect();
+        procAmpLfoGain.disconnect();
+        busNoiseBp.disconnect();
+        busNoiseGain.disconnect();
+        busNoiseLfoGain.disconnect();
+        activityGain.disconnect();
+        busToneFilter.disconnect();
+        disconnectBus();
+      },
+    };
+  }
+
+  /**
+   * CH-05: Communications — Deep Space Signal Reception:
+   * A. Receiver Standby (almost silent narrowband electronic receiver floor, no broadband wind/hiss)
+   * B. Signal Acquisition (distant drifting narrowband FM carrier tones)
+   * C. Transmission Fragments (related irregular FSK-style narrow-interval digital clusters)
+   * D. Signal Interference & Loss (restrained narrowband RF interference & soft squelch cutoffs)
+   */
+  private buildCommunicationsChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
+    const { input, outputGain, analyser, disconnectBus } = this.createChannelBus(ctx, dest);
+
+    // Band-limit Communications to clean narrow receiver spectrum (no sub-mud, no harsh hiss)
+    const commsHighpass = ctx.createBiquadFilter();
+    commsHighpass.type = 'highpass';
+    commsHighpass.frequency.value = 220;
+    commsHighpass.Q.value = 0.7;
+
+    const commsLowpass = ctx.createBiquadFilter();
+    commsLowpass.type = 'lowpass';
+    commsLowpass.frequency.value = 1650;
+    commsLowpass.Q.value = 0.7;
+
+    commsHighpass.connect(commsLowpass).connect(input);
+
+    // Sub-gate for transient transmissions so disabling Communications fades cleanly without clicks
+    const activityGain = ctx.createGain();
+    activityGain.gain.value = 0;
+    activityGain.connect(commsHighpass);
+
+    // --- Layer A: Receiver Standby (faint narrowband electronic texture, nearly silent) ---
+    const standbyNoiseBuf = createSeamlessNoiseBuffer(ctx, 13.1, 'pink');
+    const standbySrc = ctx.createBufferSource();
+    standbySrc.buffer = standbyNoiseBuf;
+    standbySrc.loop = true;
+
+    const standbyBp = ctx.createBiquadFilter();
+    standbyBp.type = 'bandpass';
+    standbyBp.frequency.value = 740;
+    standbyBp.Q.value = 6.5; // High-Q tuned IF stage avoids rushing wind/rain sound
+
+    const standbyGain = ctx.createGain();
+    standbyGain.gain.value = 0.011;
+    standbySrc.connect(standbyBp).connect(standbyGain).connect(commsHighpass);
+
+    // Very faint solid-state local oscillator floor
+    const standbyOsc = ctx.createOscillator();
+    standbyOsc.type = 'sine';
+    standbyOsc.frequency.value = 148;
+    const standbyOscGain = ctx.createGain();
+    standbyOscGain.gain.value = 0.005;
+    standbyOsc.connect(standbyOscGain).connect(commsHighpass);
+
+    // Slow narrowband tuning drift on the standby IF filter
+    const standbyDriftLfo = ctx.createOscillator();
+    standbyDriftLfo.type = 'sine';
+    standbyDriftLfo.frequency.value = 0.045;
+    const standbyDriftGain = ctx.createGain();
+    standbyDriftGain.gain.value = 42;
+    standbyDriftLfo.connect(standbyDriftGain).connect(standbyBp.frequency);
+
+    standbySrc.start();
+    standbyOsc.start();
+    standbyDriftLfo.start();
+
+    const voices = new TransientVoicePool();
+    let timerId: number | null = null;
+    let running = false;
+    let cycleCount = 0;
+
+    const clearTimer = () => {
+      if (timerId !== null) {
+        window.clearTimeout(timerId);
+        timerId = null;
+      }
+    };
+
+    /**
+     * Layer D helper: soft electronic squelch / narrowband interference burst
+     */
+    const spawnSquelchOrInterference = (
+      start: number,
+      centerFreq: number,
+      duration: number,
+      peakGain: number,
+      panVal: number,
+      sweepDown = true,
+    ) => {
+      const src = ctx.createBufferSource();
+      src.buffer = standbyNoiseBuf;
+      src.loop = true;
+
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(centerFreq, start);
+      bp.frequency.exponentialRampToValueAtTime(
+        Math.max(280, sweepDown ? centerFreq * 0.48 : centerFreq * 1.25),
+        start + duration,
+      );
+      bp.Q.value = 8.5; // Steep electronic resonance rather than broadband noise
+
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0.0001, start);
+      env.gain.linearRampToValueAtTime(peakGain, start + Math.min(0.04, duration * 0.25));
+      env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+      const pan = ctx.createStereoPanner();
+      pan.pan.value = panVal;
+
+      src.connect(bp).connect(env).connect(pan).connect(activityGain);
+      voices.track(src, () => {
+        src.disconnect();
+        bp.disconnect();
+        env.disconnect();
+        pan.disconnect();
+      });
+      src.start(start, Math.random() * 9);
+      src.stop(start + duration + 0.03);
+    };
+
+    /**
+     * Layer B: Distant drifting narrowband carrier with subtle instability (FM wobble)
+     */
+    const spawnCarrierAcquisition = (
+      start: number,
+      duration: number,
+      peakGain: number,
+      panVal: number,
+      abruptLoss: boolean,
+    ) => {
+      const startFreq = 440 + Math.random() * 560;
+      const driftDelta = (Math.random() - 0.5) * 48;
+
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(startFreq, start);
+      osc.frequency.linearRampToValueAtTime(startFreq + driftDelta, start + duration);
+
+      // Subtle instability / ionospheric flutter
+      const fmOsc = ctx.createOscillator();
+      fmOsc.type = 'sine';
+      fmOsc.frequency.value = 1.6 + Math.random() * 2.8;
+      const fmGain = ctx.createGain();
+      fmGain.gain.value = 2.5 + Math.random() * 5.5;
+      fmOsc.connect(fmGain).connect(osc.frequency);
+
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = startFreq + driftDelta * 0.5;
+      bp.Q.value = 4.5;
+
+      const env = ctx.createGain();
+      const attack = Math.min(0.9, duration * 0.42);
+      env.gain.setValueAtTime(0.0001, start);
+      env.gain.linearRampToValueAtTime(peakGain, start + attack);
+
+      if (abruptLoss) {
+        const cutoffTime = start + duration * 0.78;
+        env.gain.setValueAtTime(peakGain * 0.85, cutoffTime);
+        env.gain.exponentialRampToValueAtTime(0.0001, cutoffTime + 0.045);
+        spawnSquelchOrInterference(
+          cutoffTime - 0.015,
+          startFreq + driftDelta,
+          0.16,
+          0.035,
+          panVal,
+          true,
+        );
+      } else {
+        env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+      }
+
+      const pan = ctx.createStereoPanner();
+      pan.pan.value = panVal;
+
+      osc.connect(bp).connect(env).connect(pan).connect(activityGain);
+
+      voices.track(osc, () => {
+        osc.disconnect();
+        bp.disconnect();
+        env.disconnect();
+        pan.disconnect();
+      });
+      voices.track(fmOsc, () => {
+        fmOsc.disconnect();
+        fmGain.disconnect();
+      });
+
+      osc.start(start);
+      fmOsc.start(start);
+      osc.stop(start + duration + 0.04);
+      fmOsc.stop(start + duration + 0.04);
+    };
+
+    /**
+     * Layer C: Fragmented narrow-interval FSK-style transmission cluster
+     */
+    const spawnTransmissionFragment = (start: number, panVal: number) => {
+      const baseFreq = 540 + Math.random() * 380;
+      // Narrow related frequency ratios (avoiding musical scales or Morse regularity)
+      const ratios = [1.0, 1.055, 1.125];
+      const count = 3 + Math.floor(Math.random() * 4);
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = baseFreq * 1.06;
+      bp.Q.value = 4.0;
+
+      const pan = ctx.createStereoPanner();
+      pan.pan.value = panVal;
+      bp.connect(pan).connect(activityGain);
+
+      let cursor = start;
+      // Shape overall cluster fade so the fragment feels like a passing packet
+      const peakScale = 0.032 + Math.random() * 0.018;
+      let lastEnd = start;
+      let remaining = count;
+
+      for (let i = 0; i < count; i += 1) {
+        const pulseDur = 0.048 + Math.random() * 0.085;
+        const gap = 0.055 + Math.random() * 0.13;
+        const ratio = ratios[(i + Math.floor(Math.random() * 2)) % ratios.length];
+        const fadeFactor = 0.55 + 0.45 * Math.sin(((i + 0.5) / count) * Math.PI);
+
+        const osc = ctx.createOscillator();
+        const env = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = baseFreq * ratio;
+
+        env.gain.setValueAtTime(0.0001, cursor);
+        env.gain.linearRampToValueAtTime(peakScale * fadeFactor, cursor + 0.012);
+        env.gain.exponentialRampToValueAtTime(0.0001, cursor + pulseDur);
+
+        osc.connect(env).connect(bp);
+        voices.track(osc, () => {
+          osc.disconnect();
+          env.disconnect();
+          remaining -= 1;
+          if (remaining <= 0) {
+            bp.disconnect();
+            pan.disconnect();
+          }
+        });
+        osc.start(cursor);
+        osc.stop(cursor + pulseDur + 0.02);
+
+        lastEnd = cursor + pulseDur;
+        cursor += pulseDur + gap;
+      }
+
+      // Occasional soft squelch tail as the fragment breaks apart
+      if (Math.random() < 0.65) {
+        spawnSquelchOrInterference(lastEnd - 0.01, baseFreq * 1.08, 0.15, 0.03, panVal, true);
+      }
+    };
+
+    const scheduleSignal = () => {
+      if (!running || this.disposed || this.ctx !== ctx) return;
+
+      // Pause cleanly while tab is backgrounded; visibilitychange restarts on return
+      if (typeof document !== 'undefined' && document.hidden) {
+        timerId = null;
+        return;
+      }
+
+      let nextDelayMs = 4200 + Math.random() * 4800;
+
+      if (ctx.state === 'running') {
+        const now = ctx.currentTime;
+        cycleCount += 1;
+        const panVal = (Math.random() - 0.5) * 0.85;
+
+        // Occasional longer drifting signal sequence (~every 7th cycle)
+        if (cycleCount % 7 === 0) {
+          const longDur = 3.2 + Math.random() * 1.4;
+          spawnCarrierAcquisition(now, longDur, 0.038, panVal, false);
+          spawnTransmissionFragment(now + 1.1, panVal * 0.85);
+          nextDelayMs = 6800 + Math.random() * 5200;
+        } else {
+          const roll = Math.random();
+
+          if (roll < 0.36) {
+            // Faint carrier acquisition emerging and fading (or dropping with soft squelch)
+            const dur = 1.4 + Math.random() * 1.8;
+            const abrupt = Math.random() < 0.35;
+            spawnCarrierAcquisition(now, dur, 0.032 + Math.random() * 0.014, panVal, abrupt);
+            nextDelayMs = 3600 + Math.random() * 3800;
+          } else if (roll < 0.62) {
+            // Fragmented transmission cluster
+            spawnTransmissionFragment(now, panVal);
+            nextDelayMs = 4600 + Math.random() * 4400;
+          } else if (roll < 0.78) {
+            // Brief restrained narrowband RF interference burst
+            const freq = 620 + Math.random() * 540;
+            spawnSquelchOrInterference(now, freq, 0.22 + Math.random() * 0.18, 0.034, panVal, false);
+            nextDelayMs = 3800 + Math.random() * 4200;
+          } else {
+            // Intentional quiet listening gap — vast silent deep space between detections
+            nextDelayMs = 5500 + Math.random() * 6000;
+          }
+        }
+      }
+
+      timerId = window.setTimeout(scheduleSignal, nextDelayMs);
+    };
+
+    const start = () => {
+      if (running && timerId !== null) return;
+      running = true;
+      smoothSetParam(activityGain.gain, 1, ctx.currentTime, 0.04);
+      clearTimer();
+      timerId = window.setTimeout(scheduleSignal, 650);
+    };
+
+    const stop = () => {
+      if (!running && timerId === null) return;
+      running = false;
+      clearTimer();
+      const now = ctx.currentTime;
+      activityGain.gain.cancelScheduledValues(now);
+      activityGain.gain.setValueAtTime(activityGain.gain.value, now);
+      activityGain.gain.linearRampToValueAtTime(0, now + 0.025);
+      voices.stopAll(now, ctx.state !== 'running');
+    };
+
+    return {
+      gain: outputGain,
+      analyser,
+      start,
+      stop,
+      cleanup: () => {
+        running = false;
+        clearTimer();
+        voices.stopAll(ctx.currentTime, true);
+        for (const src of [standbySrc, standbyOsc, standbyDriftLfo]) {
+          try {
+            src.stop();
+          } catch {
+            // Ignore already stopped
+          }
+          src.disconnect();
+        }
+        standbyGain.disconnect();
+        standbyOscGain.disconnect();
+        standbyDriftGain.disconnect();
+        standbyBp.disconnect();
+        activityGain.disconnect();
+        commsHighpass.disconnect();
+        commsLowpass.disconnect();
         disconnectBus();
       },
     };
