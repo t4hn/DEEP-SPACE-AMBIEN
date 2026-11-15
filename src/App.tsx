@@ -1,4 +1,5 @@
 import { createRef, useEffect, useReducer, useRef, useState } from 'react';
+import type { AcousticProfileId } from './audio/acousticProfiles';
 import type { AmbientEventDescriptor } from './audio/ambientEvents';
 import { DeepSpaceEngine } from './audio/deepSpaceEngine';
 import {
@@ -9,6 +10,7 @@ import {
   createInitialMixerState,
   mixerReducer,
 } from './audio/mixerState';
+import { AcousticProfileSelector } from './components/AcousticProfileSelector';
 import { ChannelStrip } from './components/ChannelStrip';
 import { MasterControls } from './components/MasterControls';
 import { PresetSelector } from './components/PresetSelector';
@@ -168,6 +170,10 @@ export default function App() {
     dispatch({ type: 'SELECT_PRESET', presetId });
   };
 
+  const handleSelectAcousticProfile = (profileId: AcousticProfileId) => {
+    dispatch({ type: 'SELECT_ACOUSTIC_PROFILE', profileId });
+  };
+
   const handleToggleAmbientEvents = () => {
     if (state.ambientEventsEnabled) {
       setLastAmbientEvent(null);
@@ -252,6 +258,14 @@ export default function App() {
           <PresetSelector
             activePresetId={state.activePresetId}
             onSelectPreset={handleSelectPreset}
+          />
+        </div>
+
+        {/* Acoustic Environment Profiles */}
+        <div className="mb-3">
+          <AcousticProfileSelector
+            activeProfileId={state.acousticProfileId}
+            onSelectProfile={handleSelectAcousticProfile}
           />
         </div>
 

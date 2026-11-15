@@ -1,3 +1,9 @@
+import {
+  ACOUSTIC_PROFILES,
+  type AcousticProfileId,
+  DEFAULT_ACOUSTIC_PROFILE_ID,
+} from './acousticProfiles';
+
 export type ChannelId =
   | 'reactor'
   | 'engines'
@@ -37,6 +43,7 @@ export interface ChannelState {
 export interface MixerState {
   isActive: boolean;
   activePresetId: ActivePresetState;
+  acousticProfileId: AcousticProfileId;
   ambientEventsEnabled: boolean;
   masterVolume: number; // 0..1 linear slider value
   channels: Record<ChannelId, ChannelState>;
@@ -148,6 +155,7 @@ export function createInitialMixerState(): MixerState {
   return {
     isActive: false,
     activePresetId: null,
+    acousticProfileId: DEFAULT_ACOUSTIC_PROFILE_ID,
     ambientEventsEnabled: false,
     masterVolume: DEFAULT_MASTER_VOLUME,
     channels: {
@@ -166,6 +174,7 @@ export type MixerAction =
   | { type: 'STOP_ALL' }
   | { type: 'RESET' }
   | { type: 'SELECT_PRESET'; presetId: PresetId }
+  | { type: 'SELECT_ACOUSTIC_PROFILE'; profileId: AcousticProfileId }
   | { type: 'TOGGLE_AMBIENT_EVENTS' }
   | { type: 'TOGGLE_CHANNEL'; channelId: ChannelId }
   | { type: 'SET_CHANNEL_VOLUME'; channelId: ChannelId; volume: number }
@@ -258,9 +267,19 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
       return {
         isActive: true,
         activePresetId: null,
+        acousticProfileId: defaults.acousticProfileId,
         ambientEventsEnabled: false,
         masterVolume: defaults.masterVolume,
         channels: activeDefaultChannels,
+      };
+    }
+
+    case 'SELECT_ACOUSTIC_PROFILE': {
+      const exists = ACOUSTIC_PROFILES.some((p) => p.id === action.profileId);
+      if (!exists) return state;
+      return {
+        ...state,
+        acousticProfileId: action.profileId,
       };
     }
 

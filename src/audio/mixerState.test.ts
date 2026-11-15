@@ -294,3 +294,42 @@ test('CH-06 hull channel enables/disables independently and adjusts volume clean
   assert.equal(effectiveChannelGain(state, 'hull'), 0);
 });
 
+test('acousticProfileId defaults to bridge and switches without altering channels, master volume, or presets', () => {
+  const initial = createInitialMixerState();
+  assert.equal(initial.acousticProfileId, 'bridge');
+
+  // Switching before audio starts leaves standby and all volumes intact
+  const preStart = mixerReducer(initial, {
+    type: 'SELECT_ACOUSTIC_PROFILE',
+    profileId: 'engine-room',
+  });
+  assert.equal(preStart.acousticProfileId, 'engine-room');
+  assert.equal(preStart.isActive, false);
+  assert.equal(preStart.masterVolume, initial.masterVolume);
+  assert.deepEqual(preStart.channels, initial.channels);
+
+  // Switching while playing with preset + custom master volume + ambient events preserves everything
+  let playing = mixerReducer(preStart, { type: 'SET_MASTER_VOLUME', volume: 0.62 });
+  playing = mixerReducer(playing, { type: 'SELECT_PRESET', presetId: 'deep-transit' });
+  playing = mixerReducer(playing, { type: 'TOGGLE_AMBIENT_EVENTS' });
+
+  const switched = mixerReducer(playing, {
+    type: 'SELECT_ACOUSTIC_PROFILE',
+    profileId: 'observation-deck',
+  });
+  assert.equal(switched.acousticProfileId, 'observation-deck');
+  assert.equal(switched.isActive, true);
+  assert.equal(switched.activePresetId, 'deep-transit');
+  assert.equal(switched.masterVolume, 0.62);
+  assert.equal(switched.ambientEventsEnabled, true);
+  assert.deepEqual(switched.channels, playing.channels);
+
+  const lab = mixerReducer(switched, {
+    type: 'SELECT_ACOUSTIC_PROFILE',
+    profileId: 'research-lab',
+  });
+  assert.equal(lab.acousticProfileId, 'research-lab');
+  assert.deepEqual(lab.channels, playing.channels);
+});
+
+

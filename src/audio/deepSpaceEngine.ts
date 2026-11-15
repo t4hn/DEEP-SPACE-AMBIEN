@@ -1,4 +1,12 @@
 import {
+  ACOUSTIC_BYPASS_LOWPASS_HZ,
+  type AcousticProfile,
+  type AcousticProfileId,
+  DEFAULT_ACOUSTIC_PROFILE_ID,
+  applySpatialOffset,
+  getAcousticProfile,
+} from './acousticProfiles';
+import {
   type AmbientEventDescriptor,
   type AmbientEventType,
   computeAmbientEventDelayMs,
@@ -32,6 +40,7 @@ interface ChannelAudioNodes {
   gain: GainNode;
   eventBus: GainNode;
   analyser: AnalyserNode;
+  applyProfile: (profile: AcousticProfile, now: number) => void;
   start?: () => void;
   stop?: () => void;
   cleanup: () => void;
@@ -48,10 +57,29 @@ interface SpatialVoiceConfig {
   rolloffFactor: number;
   distanceGain?: number;
   airAbsorptionHz?: number | null;
+  lowShelfGainDb?: number;
+  mutable?: boolean;
+}
+
+interface SpatialBusUpdateParams {
+  pos: SpatialVec3;
+  refDistance: number;
+  rolloffFactor: number;
+  distanceGain: number;
+  airAbsorptionHz: number | null;
+  lowShelfGainDb: number;
+  now: number;
 }
 
 interface SpatialBusHandle {
   input: AudioNode;
+  update?: (params: SpatialBusUpdateParams) => void;
+  disconnect: () => void;
+}
+
+interface AcousticReflectionBusHandle {
+  input: GainNode;
+  applyProfile: (profile: AcousticProfile, now: number) => void;
   disconnect: () => void;
 }
 
@@ -227,14 +255,31 @@ function createSpatialBus(
     rolloffFactor,
     distanceGain = 1,
     airAbsorptionHz = null,
+    lowShelfGainDb = 0,
+    mutable = false,
   } = config;
 
   const chain: AudioNode[] = [];
+  let lowShelfFilter: BiquadFilterNode | null = null;
+  let airFilter: BiquadFilterNode | null = null;
+  let trimGain: GainNode | null = null;
+  let pannerNode: PannerNode | null = null;
+  let fallbackAttenGain: GainNode | null = null;
+  let fallbackStereoNode: StereoPannerNode | null = null;
 
-  if (airAbsorptionHz !== null) {
-    const airFilter = ctx.createBiquadFilter();
+  if (mutable || lowShelfGainDb !== 0) {
+    lowShelfFilter = ctx.createBiquadFilter();
+    lowShelfFilter.type = 'lowshelf';
+    lowShelfFilter.frequency.value = 105;
+    lowShelfFilter.Q.value = 0.7;
+    lowShelfFilter.gain.value = lowShelfGainDb;
+    chain.push(lowShelfFilter);
+  }
+
+  if (mutable || airAbsorptionHz !== null) {
+    airFilter = ctx.createBiquadFilter();
     airFilter.type = 'lowpass';
-    airFilter.frequency.value = airAbsorptionHz;
+    airFilter.frequency.value = airAbsorptionHz ?? ACOUSTIC_BYPASS_LOWPASS_HZ;
     airFilter.Q.value = 0.65;
     chain.push(airFilter);
   }
@@ -266,12 +311,13 @@ function createSpatialBus(
         rampPannerPositionTo(panner, endPos, startTime + durationSec);
       }
 
-      if (distanceGain !== 1) {
-        const trim = ctx.createGain();
-        trim.gain.value = distanceGain;
-        chain.push(trim);
+      if (mutable || distanceGain !== 1) {
+        trimGain = ctx.createGain();
+        trimGain.gain.value = distanceGain;
+        chain.push(trimGain);
       }
       chain.push(panner);
+      pannerNode = panner;
       usedPanner = true;
     } catch {
       // Fall through to StereoPannerNode fallback
@@ -287,6 +333,7 @@ function createSpatialBus(
       attenGain.gain.linearRampToValueAtTime(endAtten, startTime + durationSec);
     }
     chain.push(attenGain);
+    fallbackAttenGain = attenGain;
 
     if (typeof ctx.createStereoPanner === 'function') {
       const stereo = ctx.createStereoPanner();
@@ -302,6 +349,7 @@ function createSpatialBus(
         );
       }
       chain.push(stereo);
+      fallbackStereoNode = stereo;
     }
   }
 
@@ -312,6 +360,48 @@ function createSpatialBus(
     chain[chain.length - 1].connect(dest);
     return {
       input: chain[0],
+      update: mutable
+        ? (params: SpatialBusUpdateParams) => {
+            if (lowShelfFilter) {
+              smoothSetParam(lowShelfFilter.gain, params.lowShelfGainDb, params.now, 0.08);
+            }
+            if (airFilter) {
+              smoothSetParam(
+                airFilter.frequency,
+                params.airAbsorptionHz ?? ACOUSTIC_BYPASS_LOWPASS_HZ,
+                params.now,
+                0.08,
+              );
+            }
+            if (pannerNode) {
+              pannerNode.refDistance = params.refDistance;
+              pannerNode.rolloffFactor = params.rolloffFactor;
+              if (trimGain) {
+                smoothSetParam(trimGain.gain, params.distanceGain, params.now, 0.08);
+              }
+              if ('positionX' in pannerNode && pannerNode.positionX) {
+                smoothSetParam(pannerNode.positionX, params.pos.x, params.now, 0.09);
+                smoothSetParam(pannerNode.positionY, params.pos.y, params.now, 0.09);
+                smoothSetParam(pannerNode.positionZ, params.pos.z, params.now, 0.09);
+              } else {
+                setPannerPositionAt(pannerNode, params.pos, params.now);
+              }
+            } else if (fallbackAttenGain) {
+              const targetAtten =
+                computeDistanceAttenuation(params.pos, params.refDistance, params.rolloffFactor) *
+                params.distanceGain;
+              smoothSetParam(fallbackAttenGain.gain, targetAtten, params.now, 0.08);
+              if (fallbackStereoNode) {
+                smoothSetParam(
+                  fallbackStereoNode.pan,
+                  computeFallbackStereoPan(params.pos),
+                  params.now,
+                  0.08,
+                );
+              }
+            }
+          }
+        : undefined,
       disconnect: () => {
         for (const node of chain) {
           node.disconnect();
@@ -328,6 +418,96 @@ function createSpatialBus(
     input: passthrough,
     disconnect: () => {
       passthrough.disconnect();
+    },
+  };
+}
+
+/**
+ * Lightweight stereo early-reflection bus using native Web Audio DelayNode &
+ * BiquadFilterNode pairs. Strips sub-bass below 160 Hz so deep Reactor/Engine
+ * fundamentals stay tight and phase-clean across all acoustic profiles.
+ */
+function createAcousticReflectionBus(
+  ctx: AudioContext,
+  masterGain: AudioNode,
+  initialProfile: AcousticProfile,
+): AcousticReflectionBusHandle {
+  const input = ctx.createGain();
+  input.gain.value = 1;
+
+  const highpass = ctx.createBiquadFilter();
+  highpass.type = 'highpass';
+  highpass.frequency.value = 160;
+  highpass.Q.value = 0.7;
+
+  const dampLowpass = ctx.createBiquadFilter();
+  dampLowpass.type = 'lowpass';
+  dampLowpass.frequency.value = initialProfile.reflection.dampingHz;
+  dampLowpass.Q.value = 0.65;
+
+  const delayL = ctx.createDelay(0.15);
+  delayL.delayTime.value = initialProfile.reflection.delayLeftSec;
+
+  const delayR = ctx.createDelay(0.15);
+  delayR.delayTime.value = initialProfile.reflection.delayRightSec;
+
+  const feedbackL = ctx.createGain();
+  feedbackL.gain.value = Math.min(0.35, initialProfile.reflection.feedbackGain);
+
+  const feedbackR = ctx.createGain();
+  feedbackR.gain.value = Math.min(0.35, initialProfile.reflection.feedbackGain);
+
+  const wetGain = ctx.createGain();
+  wetGain.gain.value = initialProfile.reflection.wetGain;
+
+  const merger =
+    typeof ctx.createChannelMerger === 'function' ? ctx.createChannelMerger(2) : null;
+
+  input.connect(highpass);
+  highpass.connect(dampLowpass);
+  dampLowpass.connect(delayL);
+  dampLowpass.connect(delayR);
+
+  // Subtle cross-coupled early bounce (loop gain = feedback^2 <= 0.12)
+  delayL.connect(feedbackL);
+  feedbackL.connect(delayR);
+  delayR.connect(feedbackR);
+  feedbackR.connect(delayL);
+
+  if (merger) {
+    delayL.connect(merger, 0, 0);
+    delayR.connect(merger, 0, 1);
+    merger.connect(wetGain);
+  } else {
+    delayL.connect(wetGain);
+    delayR.connect(wetGain);
+  }
+  wetGain.connect(masterGain);
+
+  return {
+    input,
+    applyProfile: (profile: AcousticProfile, now: number) => {
+      const r = profile.reflection;
+      smoothSetParam(dampLowpass.frequency, r.dampingHz, now, 0.08);
+      smoothSetParam(delayL.delayTime, r.delayLeftSec, now, 0.12);
+      smoothSetParam(delayR.delayTime, r.delayRightSec, now, 0.12);
+      const safeFeedback = Math.min(0.35, r.feedbackGain);
+      smoothSetParam(feedbackL.gain, safeFeedback, now, 0.08);
+      smoothSetParam(feedbackR.gain, safeFeedback, now, 0.08);
+      smoothSetParam(wetGain.gain, r.wetGain, now, 0.08);
+    },
+    disconnect: () => {
+      input.disconnect();
+      highpass.disconnect();
+      dampLowpass.disconnect();
+      delayL.disconnect();
+      delayR.disconnect();
+      feedbackL.disconnect();
+      feedbackR.disconnect();
+      if (merger) {
+        merger.disconnect();
+      }
+      wetGain.disconnect();
     },
   };
 }
@@ -379,9 +559,11 @@ export class DeepSpaceEngine {
   private ctx: AudioContext | null = null;
   private masterGain: GainNode | null = null;
   private compressor: DynamicsCompressorNode | null = null;
+  private reflectionBus: AcousticReflectionBusHandle | null = null;
   private channels: Partial<Record<ChannelId, ChannelAudioNodes>> = {};
   private analyserScratch = new Float32Array(256);
 
+  private activeAcousticProfileId: AcousticProfileId = DEFAULT_ACOUSTIC_PROFILE_ID;
   private latestState: MixerState | null = null;
   private suspendTimer: number | null = null;
   private disposed = false;
@@ -493,7 +675,7 @@ export class DeepSpaceEngine {
     const masterGain = ctx.createGain();
     masterGain.gain.value = 0;
 
-    // Gentle transparent mastering compressor so all 5 channels blend without clipping
+    // Gentle transparent mastering compressor so all 6 channels blend without clipping
     const compressor = ctx.createDynamicsCompressor();
     compressor.threshold.value = -12;
     compressor.knee.value = 20;
@@ -506,9 +688,15 @@ export class DeepSpaceEngine {
 
     configureSpatialListener(ctx);
 
+    const initialProfileId =
+      this.latestState?.acousticProfileId ?? DEFAULT_ACOUSTIC_PROFILE_ID;
+    this.activeAcousticProfileId = initialProfileId;
+    const initialProfile = getAcousticProfile(initialProfileId);
+
     this.ctx = ctx;
     this.masterGain = masterGain;
     this.compressor = compressor;
+    this.reflectionBus = createAcousticReflectionBus(ctx, masterGain, initialProfile);
 
     this.channels.reactor = this.buildReactorChannel(ctx, masterGain);
     this.channels.engines = this.buildEnginesChannel(ctx, masterGain);
@@ -518,6 +706,51 @@ export class DeepSpaceEngine {
     this.channels.hull = this.buildHullChannel(ctx, masterGain);
 
     return ctx;
+  }
+
+  private applyAcousticProfile(profileId: AcousticProfileId): void {
+    this.activeAcousticProfileId = profileId;
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    const profile = getAcousticProfile(profileId);
+    this.reflectionBus?.applyProfile(profile, now);
+
+    for (const ch of CHANNELS) {
+      this.channels[ch.id]?.applyProfile(profile, now);
+    }
+  }
+
+  private resolveChannelSpatial(
+    channelId: ChannelId,
+    baseStart: SpatialVec3,
+    baseEnd?: SpatialVec3,
+    baseAirHz?: number | null,
+  ): {
+    startPos: SpatialVec3;
+    endPos?: SpatialVec3;
+    refDistance: number;
+    maxDistance: number;
+    rolloffFactor: number;
+    distanceGain: number;
+    airAbsorptionHz: number | null;
+  } {
+    const baseProfile = CHANNEL_SPATIAL_PROFILES[channelId];
+    const adj = getAcousticProfile(this.activeAcousticProfileId).channels[channelId];
+    const startPos = applySpatialOffset(baseStart, adj.positionOffset);
+    const endPos = baseEnd ? applySpatialOffset(baseEnd, adj.positionOffset) : undefined;
+    return {
+      startPos,
+      endPos,
+      refDistance: baseProfile.refDistance * adj.refDistanceScale,
+      maxDistance: baseProfile.maxDistance,
+      rolloffFactor: baseProfile.rolloffFactor * adj.rolloffScale,
+      distanceGain: baseProfile.distanceGain * adj.distanceTrim,
+      airAbsorptionHz:
+        baseAirHz !== undefined && baseAirHz !== null
+          ? computeDistanceLowpassHz(startPos, baseAirHz)
+          : null,
+    };
   }
 
   private createChannelBus(
@@ -531,17 +764,31 @@ export class DeepSpaceEngine {
     outputGain: GainNode;
     analyser: AnalyserNode;
     spatialProfile: ChannelSpatialProfile;
+    applyProfile: (profile: AcousticProfile, now: number) => void;
     disconnectBus: () => void;
   } {
     const spatialProfile = CHANNEL_SPATIAL_PROFILES[channelId];
+    const initialProfile = getAcousticProfile(this.activeAcousticProfileId);
+    const initialAdj = initialProfile.channels[channelId];
 
     // Continuous bed path: input -> channel spatial panner -> outputGain
     const input = ctx.createGain();
     input.gain.value = 1;
 
-    // Pre-spatialized transient & ambient-event path avoids double-panning
+    // Pre-spatialized transient & ambient-event path avoids double-panning while sharing acoustic EQ
     const spatialInput = ctx.createGain();
     spatialInput.gain.value = 1;
+
+    const transientLowShelf = ctx.createBiquadFilter();
+    transientLowShelf.type = 'lowshelf';
+    transientLowShelf.frequency.value = 105;
+    transientLowShelf.Q.value = 0.7;
+    transientLowShelf.gain.value = initialAdj.lowShelfGainDb;
+
+    const transientAirFilter = ctx.createBiquadFilter();
+    transientAirFilter.type = 'lowpass';
+    transientAirFilter.frequency.value = initialAdj.lowpassCutoffHz ?? ACOUSTIC_BYPASS_LOWPASS_HZ;
+    transientAirFilter.Q.value = 0.65;
 
     const eventBus = ctx.createGain();
     eventBus.gain.value = 1;
@@ -554,20 +801,63 @@ export class DeepSpaceEngine {
     analyser.fftSize = 256;
     analyser.smoothingTimeConstant = 0.78;
 
+    const initialBedPos = applySpatialOffset(spatialProfile.position, initialAdj.positionOffset);
+    const initialAirHz =
+      spatialProfile.airAbsorptionHz !== null && initialAdj.lowpassCutoffHz !== null
+        ? Math.min(spatialProfile.airAbsorptionHz, initialAdj.lowpassCutoffHz)
+        : (spatialProfile.airAbsorptionHz ?? initialAdj.lowpassCutoffHz);
+
     const bedSpatial = createSpatialBus(ctx, outputGain, {
-      startPos: spatialProfile.position,
+      startPos: initialBedPos,
       panningModel: spatialProfile.panningModel,
-      refDistance: spatialProfile.refDistance,
+      refDistance: spatialProfile.refDistance * initialAdj.refDistanceScale,
       maxDistance: spatialProfile.maxDistance,
-      rolloffFactor: spatialProfile.rolloffFactor,
-      distanceGain: spatialProfile.distanceGain,
-      airAbsorptionHz: spatialProfile.airAbsorptionHz,
+      rolloffFactor: spatialProfile.rolloffFactor * initialAdj.rolloffScale,
+      distanceGain: spatialProfile.distanceGain * initialAdj.distanceTrim,
+      airAbsorptionHz: initialAirHz,
+      lowShelfGainDb: initialAdj.lowShelfGainDb,
+      mutable: true,
     });
 
+    const reflectionSend = ctx.createGain();
+    reflectionSend.gain.value = initialAdj.reflectionSend;
+    if (this.reflectionBus) {
+      outputGain.connect(reflectionSend);
+      reflectionSend.connect(this.reflectionBus.input);
+    }
+
     input.connect(bedSpatial.input);
-    spatialInput.connect(outputGain);
+    spatialInput.connect(transientLowShelf).connect(transientAirFilter).connect(outputGain);
     outputGain.connect(analyser);
     analyser.connect(destination);
+
+    const applyProfile = (profile: AcousticProfile, now: number) => {
+      const adj = profile.channels[channelId];
+      const nextPos = applySpatialOffset(spatialProfile.position, adj.positionOffset);
+      const nextAirHz =
+        spatialProfile.airAbsorptionHz !== null && adj.lowpassCutoffHz !== null
+          ? Math.min(spatialProfile.airAbsorptionHz, adj.lowpassCutoffHz)
+          : (spatialProfile.airAbsorptionHz ?? adj.lowpassCutoffHz);
+
+      bedSpatial.update?.({
+        pos: nextPos,
+        refDistance: spatialProfile.refDistance * adj.refDistanceScale,
+        rolloffFactor: spatialProfile.rolloffFactor * adj.rolloffScale,
+        distanceGain: spatialProfile.distanceGain * adj.distanceTrim,
+        airAbsorptionHz: nextAirHz,
+        lowShelfGainDb: adj.lowShelfGainDb,
+        now,
+      });
+
+      smoothSetParam(transientLowShelf.gain, adj.lowShelfGainDb, now, 0.08);
+      smoothSetParam(
+        transientAirFilter.frequency,
+        adj.lowpassCutoffHz ?? ACOUSTIC_BYPASS_LOWPASS_HZ,
+        now,
+        0.08,
+      );
+      smoothSetParam(reflectionSend.gain, adj.reflectionSend, now, 0.08);
+    };
 
     return {
       input,
@@ -576,11 +866,15 @@ export class DeepSpaceEngine {
       outputGain,
       analyser,
       spatialProfile,
+      applyProfile,
       disconnectBus: () => {
         eventBus.disconnect();
         spatialInput.disconnect();
+        transientLowShelf.disconnect();
+        transientAirFilter.disconnect();
         input.disconnect();
         bedSpatial.disconnect();
+        reflectionSend.disconnect();
         outputGain.disconnect();
         analyser.disconnect();
       },
@@ -591,11 +885,8 @@ export class DeepSpaceEngine {
    * CH-01: Reactor — Deep, warm, continuous mechanical hum with subtle fluctuations
    */
   private buildReactorChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
-    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(
-      ctx,
-      dest,
-      'reactor',
-    );
+    const { input, eventBus, outputGain, analyser, applyProfile, disconnectBus } =
+      this.createChannelBus(ctx, dest, 'reactor');
 
     // Subsonic highpass removes DC / ultra-low mud without thinning the 52 Hz core
     const subsonicFilter = ctx.createBiquadFilter();
@@ -675,6 +966,7 @@ export class DeepSpaceEngine {
       gain: outputGain,
       eventBus,
       analyser,
+      applyProfile,
       cleanup: () => {
         for (const src of [osc1, osc2, osc3, osc4, lfo1, lfo2, noiseSrc]) {
           try {
@@ -702,11 +994,8 @@ export class DeepSpaceEngine {
    * CH-02: Engines — Layered, low-frequency mechanical rumble
    */
   private buildEnginesChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
-    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(
-      ctx,
-      dest,
-      'engines',
-    );
+    const { input, eventBus, outputGain, analyser, applyProfile, disconnectBus } =
+      this.createChannelBus(ctx, dest, 'engines');
 
     const subsonicHp = ctx.createBiquadFilter();
     subsonicHp.type = 'highpass';
@@ -785,6 +1074,7 @@ export class DeepSpaceEngine {
       gain: outputGain,
       eventBus,
       analyser,
+      applyProfile,
       cleanup: () => {
         for (const src of [srcA, srcB, driveOsc1, driveOsc2, lfoA, lfoB]) {
           try {
@@ -812,11 +1102,8 @@ export class DeepSpaceEngine {
    * CH-03: Ventilation — Soft, consistent airflow without excessive high-frequency noise
    */
   private buildVentilationChannel(ctx: AudioContext, dest: AudioNode): ChannelAudioNodes {
-    const { input, eventBus, outputGain, analyser, disconnectBus } = this.createChannelBus(
-      ctx,
-      dest,
-      'ventilation',
-    );
+    const { input, eventBus, outputGain, analyser, applyProfile, disconnectBus } =
+      this.createChannelBus(ctx, dest, 'ventilation');
 
     const highpass = ctx.createBiquadFilter();
     highpass.type = 'highpass';
@@ -876,6 +1163,7 @@ export class DeepSpaceEngine {
       gain: outputGain,
       eventBus,
       analyser,
+      applyProfile,
       cleanup: () => {
         for (const src of [src1, src2, lfo]) {
           try {
@@ -911,7 +1199,7 @@ export class DeepSpaceEngine {
       eventBus,
       outputGain,
       analyser,
-      spatialProfile,
+      applyProfile,
       disconnectBus,
     } = this.createChannelBus(ctx, dest, 'systems');
 
@@ -1055,14 +1343,11 @@ export class DeepSpaceEngine {
     ) => {
       const osc = ctx.createOscillator();
       const env = ctx.createGain();
+      const spatialCfg = this.resolveChannelSpatial('systems', position);
       const spatial = createSpatialBus(ctx, activityGain, {
-        startPos: position,
+        ...spatialCfg,
         startTime: start,
         panningModel: 'HRTF',
-        refDistance: spatialProfile.refDistance,
-        maxDistance: spatialProfile.maxDistance,
-        rolloffFactor: spatialProfile.rolloffFactor,
-        distanceGain: spatialProfile.distanceGain,
       });
 
       osc.type = 'sine';
@@ -1133,14 +1418,11 @@ export class DeepSpaceEngine {
       const env = ctx.createGain();
       env.gain.value = peakGain;
 
+      const spatialCfg = this.resolveChannelSpatial('systems', position);
       const spatial = createSpatialBus(ctx, activityGain, {
-        startPos: position,
+        ...spatialCfg,
         startTime: start,
         panningModel: 'HRTF',
-        refDistance: spatialProfile.refDistance,
-        maxDistance: spatialProfile.maxDistance,
-        rolloffFactor: spatialProfile.rolloffFactor,
-        distanceGain: spatialProfile.distanceGain,
       });
 
       src.connect(bp).connect(env).connect(spatial.input);
@@ -1260,6 +1542,7 @@ export class DeepSpaceEngine {
       gain: outputGain,
       eventBus,
       analyser,
+      applyProfile,
       start,
       stop,
       cleanup: () => {
@@ -1306,7 +1589,7 @@ export class DeepSpaceEngine {
       eventBus,
       outputGain,
       analyser,
-      spatialProfile,
+      applyProfile,
       disconnectBus,
     } = this.createChannelBus(ctx, dest, 'communications');
 
@@ -1417,17 +1700,17 @@ export class DeepSpaceEngine {
       env.gain.linearRampToValueAtTime(peakGain, start + Math.min(0.04, duration * 0.25));
       env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
 
+      const spatialCfg = this.resolveChannelSpatial(
+        'communications',
+        trajectory.start,
+        trajectory.end,
+        1850,
+      );
       const spatial = createSpatialBus(ctx, activityGain, {
-        startPos: trajectory.start,
-        endPos: trajectory.end,
+        ...spatialCfg,
         startTime: start,
         durationSec: duration,
         panningModel: 'HRTF',
-        refDistance: spatialProfile.refDistance,
-        maxDistance: spatialProfile.maxDistance,
-        rolloffFactor: spatialProfile.rolloffFactor,
-        distanceGain: spatialProfile.distanceGain,
-        airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 1850),
       });
 
       src.connect(bp).connect(env).connect(spatial.input);
@@ -1493,17 +1776,17 @@ export class DeepSpaceEngine {
         env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
       }
 
+      const spatialCfg = this.resolveChannelSpatial(
+        'communications',
+        trajectory.start,
+        trajectory.end,
+        1850,
+      );
       const spatial = createSpatialBus(ctx, activityGain, {
-        startPos: trajectory.start,
-        endPos: trajectory.end,
+        ...spatialCfg,
         startTime: start,
         durationSec: duration,
         panningModel: 'HRTF',
-        refDistance: spatialProfile.refDistance,
-        maxDistance: spatialProfile.maxDistance,
-        rolloffFactor: spatialProfile.rolloffFactor,
-        distanceGain: spatialProfile.distanceGain,
-        airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 1850),
       });
 
       osc.connect(bp).connect(env).connect(spatial.input);
@@ -1539,17 +1822,17 @@ export class DeepSpaceEngine {
       bp.Q.value = 4.0;
 
       const estDuration = count * 0.19;
+      const spatialCfg = this.resolveChannelSpatial(
+        'communications',
+        trajectory.start,
+        trajectory.end,
+        1850,
+      );
       const spatial = createSpatialBus(ctx, activityGain, {
-        startPos: trajectory.start,
-        endPos: trajectory.end,
+        ...spatialCfg,
         startTime: start,
         durationSec: estDuration,
         panningModel: 'HRTF',
-        refDistance: spatialProfile.refDistance,
-        maxDistance: spatialProfile.maxDistance,
-        rolloffFactor: spatialProfile.rolloffFactor,
-        distanceGain: spatialProfile.distanceGain,
-        airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 1850),
       });
       bp.connect(spatial.input);
 
@@ -1683,6 +1966,7 @@ export class DeepSpaceEngine {
       gain: outputGain,
       eventBus,
       analyser,
+      applyProfile,
       start,
       stop,
       cleanup: () => {
@@ -1725,7 +2009,7 @@ export class DeepSpaceEngine {
       eventBus,
       outputGain,
       analyser,
-      spatialProfile,
+      applyProfile,
       disconnectBus,
     } = this.createChannelBus(ctx, dest, 'hull');
 
@@ -1897,17 +2181,17 @@ export class DeepSpaceEngine {
       env.gain.linearRampToValueAtTime(peakGain, start + attack);
       env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
 
+      const spatialCfg = this.resolveChannelSpatial(
+        'hull',
+        trajectory.start,
+        trajectory.end,
+        1100,
+      );
       const spatial = createSpatialBus(ctx, activityGain, {
-        startPos: trajectory.start,
-        endPos: trajectory.end,
+        ...spatialCfg,
         startTime: start,
         durationSec: duration,
         panningModel: 'HRTF',
-        refDistance: spatialProfile.refDistance,
-        maxDistance: spatialProfile.maxDistance,
-        rolloffFactor: spatialProfile.rolloffFactor,
-        distanceGain: spatialProfile.distanceGain,
-        airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 1100),
       });
 
       const osc1 = ctx.createOscillator();
@@ -1990,17 +2274,17 @@ export class DeepSpaceEngine {
       env.gain.linearRampToValueAtTime(peakGain, start + duration * 0.34);
       env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
 
+      const spatialCfg = this.resolveChannelSpatial(
+        'hull',
+        trajectory.start,
+        trajectory.end,
+        960,
+      );
       const spatial = createSpatialBus(ctx, activityGain, {
-        startPos: trajectory.start,
-        endPos: trajectory.end,
+        ...spatialCfg,
         startTime: start,
         durationSec: duration,
         panningModel: 'HRTF',
-        refDistance: spatialProfile.refDistance,
-        maxDistance: spatialProfile.maxDistance,
-        rolloffFactor: spatialProfile.rolloffFactor,
-        distanceGain: spatialProfile.distanceGain,
-        airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 960),
       });
 
       // Three heavy inharmonic steel modes (1.0, 1.59, 2.54)
@@ -2033,15 +2317,11 @@ export class DeepSpaceEngine {
         y: trajectory.end.y * 0.7,
         z: -trajectory.end.z * 0.85,
       };
+      const echoSpatialCfg = this.resolveChannelSpatial('hull', echoPos, undefined, 850);
       const echoSpatial = createSpatialBus(ctx, activityGain, {
-        startPos: echoPos,
+        ...echoSpatialCfg,
         startTime: start + 0.45,
         panningModel: 'HRTF',
-        refDistance: spatialProfile.refDistance,
-        maxDistance: spatialProfile.maxDistance,
-        rolloffFactor: spatialProfile.rolloffFactor,
-        distanceGain: spatialProfile.distanceGain,
-        airAbsorptionHz: computeDistanceLowpassHz(echoPos, 850),
       });
 
       const g2 = ctx.createGain();
@@ -2151,6 +2431,7 @@ export class DeepSpaceEngine {
       gain: outputGain,
       eventBus,
       analyser,
+      applyProfile,
       start,
       stop,
       cleanup: () => {
@@ -2205,12 +2486,17 @@ export class DeepSpaceEngine {
     this.latestState = state;
 
     if (!state.isActive && !this.ctx) {
-      // Respect browser autoplay policy: do not allocate AudioContext until user activates audio
+      // Respect browser autoplay policy: store profile selection without allocating AudioContext
+      this.activeAcousticProfileId = state.acousticProfileId;
       return;
     }
 
     const ctx = this.ensureInitialized();
     const now = ctx.currentTime;
+
+    if (state.acousticProfileId !== this.activeAcousticProfileId) {
+      this.applyAcousticProfile(state.acousticProfileId);
+    }
 
     if (state.isActive) {
       this.clearPendingSuspend();
@@ -2437,14 +2723,11 @@ export class DeepSpaceEngine {
   private triggerReactorFluctuation(ctx: AudioContext, dest: AudioNode, start: number): number {
     const duration = 3.2;
     const profile = CHANNEL_SPATIAL_PROFILES.reactor;
+    const spatialCfg = this.resolveChannelSpatial('reactor', profile.position);
     const spatial = createSpatialBus(ctx, dest, {
-      startPos: profile.position,
+      ...spatialCfg,
       startTime: start,
       panningModel: profile.panningModel,
-      refDistance: profile.refDistance,
-      maxDistance: profile.maxDistance,
-      rolloffFactor: profile.rolloffFactor,
-      distanceGain: profile.distanceGain,
     });
 
     const lp = ctx.createBiquadFilter();
@@ -2515,7 +2798,6 @@ export class DeepSpaceEngine {
    */
   private triggerNavigationBeacon(ctx: AudioContext, dest: AudioNode, start: number): number {
     const carrierBase = 880 + Math.random() * 240;
-    const profile = CHANNEL_SPATIAL_PROFILES.communications;
     const trajectory = sampleCommunicationsTrajectory(false);
     const pulses = [
       { offset: 0, dur: 0.22, freq: carrierBase },
@@ -2528,15 +2810,16 @@ export class DeepSpaceEngine {
     bp.frequency.value = carrierBase * 1.04;
     bp.Q.value = 5.5;
 
+    const spatialCfg = this.resolveChannelSpatial(
+      'communications',
+      trajectory.start,
+      undefined,
+      1950,
+    );
     const spatial = createSpatialBus(ctx, dest, {
-      startPos: trajectory.start,
+      ...spatialCfg,
       startTime: start,
       panningModel: 'HRTF',
-      refDistance: profile.refDistance,
-      maxDistance: profile.maxDistance,
-      rolloffFactor: profile.rolloffFactor,
-      distanceGain: profile.distanceGain,
-      airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 1950),
     });
     bp.connect(spatial.input);
 
@@ -2576,7 +2859,6 @@ export class DeepSpaceEngine {
   private triggerCommsInterference(ctx: AudioContext, dest: AudioNode, start: number): number {
     const duration = 1.65;
     const centerFreq = 640 + Math.random() * 320;
-    const profile = CHANNEL_SPATIAL_PROFILES.communications;
     const trajectory = sampleCommunicationsTrajectory(Math.random() < 0.45);
 
     const noiseSrc = ctx.createBufferSource();
@@ -2612,17 +2894,17 @@ export class DeepSpaceEngine {
     carrierEnv.gain.linearRampToValueAtTime(0.022, start + 0.18);
     carrierEnv.gain.exponentialRampToValueAtTime(0.0001, start + duration * 0.85);
 
+    const spatialCfg = this.resolveChannelSpatial(
+      'communications',
+      trajectory.start,
+      trajectory.end,
+      1850,
+    );
     const spatial = createSpatialBus(ctx, dest, {
-      startPos: trajectory.start,
-      endPos: trajectory.end,
+      ...spatialCfg,
       startTime: start,
       durationSec: duration,
       panningModel: 'HRTF',
-      refDistance: profile.refDistance,
-      maxDistance: profile.maxDistance,
-      rolloffFactor: profile.rolloffFactor,
-      distanceGain: profile.distanceGain,
-      airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 1850),
     });
 
     noiseSrc.connect(bp).connect(noiseEnv).connect(spatial.input);
@@ -2668,7 +2950,6 @@ export class DeepSpaceEngine {
   private triggerSystemDiagnostic(ctx: AudioContext, dest: AudioNode, start: number): number {
     const notes = [392.0, 493.88, 587.33, 440.0];
     const stepSec = 0.165;
-    const profile = CHANNEL_SPATIAL_PROFILES.systems;
     const pos = sampleSystemsTransientPosition();
 
     const lp = ctx.createBiquadFilter();
@@ -2676,14 +2957,11 @@ export class DeepSpaceEngine {
     lp.frequency.value = 1320;
     lp.Q.value = 0.7;
 
+    const spatialCfg = this.resolveChannelSpatial('systems', pos);
     const spatial = createSpatialBus(ctx, dest, {
-      startPos: pos,
+      ...spatialCfg,
       startTime: start,
       panningModel: 'HRTF',
-      refDistance: profile.refDistance,
-      maxDistance: profile.maxDistance,
-      rolloffFactor: profile.rolloffFactor,
-      distanceGain: profile.distanceGain,
     });
     lp.connect(spatial.input);
 
@@ -2732,7 +3010,6 @@ export class DeepSpaceEngine {
   ): number {
     const duration = 2.6;
     const baseFreq = 685 + Math.random() * 140;
-    const profile = CHANNEL_SPATIAL_PROFILES[targetChannel];
     const trajectory: SpatialTrajectory =
       targetChannel === 'communications'
         ? sampleCommunicationsTrajectory(Math.random() < 0.45)
@@ -2746,20 +3023,17 @@ export class DeepSpaceEngine {
     bp.frequency.value = baseFreq;
     bp.Q.value = 4.6;
 
+    const spatialCfg = this.resolveChannelSpatial(
+      targetChannel,
+      trajectory.start,
+      trajectory.end,
+      targetChannel === 'communications' ? 1950 : null,
+    );
     const spatial = createSpatialBus(ctx, dest, {
-      startPos: trajectory.start,
-      endPos: trajectory.end,
+      ...spatialCfg,
       startTime: start,
       durationSec: duration,
       panningModel: 'HRTF',
-      refDistance: profile.refDistance,
-      maxDistance: profile.maxDistance,
-      rolloffFactor: profile.rolloffFactor,
-      distanceGain: profile.distanceGain,
-      airAbsorptionHz:
-        targetChannel === 'communications'
-          ? computeDistanceLowpassHz(trajectory.start, 1950)
-          : null,
     });
     bp.connect(spatial.input);
 
@@ -2830,7 +3104,6 @@ export class DeepSpaceEngine {
   private triggerStructuralResonance(ctx: AudioContext, dest: AudioNode, start: number): number {
     const duration = 4.4;
     const baseFreq = 62 + Math.random() * 14;
-    const profile = CHANNEL_SPATIAL_PROFILES.hull;
     const trajectory = sampleHullSurroundingTrajectory(false);
 
     const bp = ctx.createBiquadFilter();
@@ -2845,15 +3118,11 @@ export class DeepSpaceEngine {
     env.gain.linearRampToValueAtTime(0.075, start + 1.6);
     env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
 
+    const spatialCfg = this.resolveChannelSpatial('hull', trajectory.start, undefined, 1050);
     const spatial = createSpatialBus(ctx, dest, {
-      startPos: trajectory.start,
+      ...spatialCfg,
       startTime: start,
       panningModel: 'HRTF',
-      refDistance: profile.refDistance,
-      maxDistance: profile.maxDistance,
-      rolloffFactor: profile.rolloffFactor,
-      distanceGain: profile.distanceGain,
-      airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 1050),
     });
 
     const osc1 = ctx.createOscillator();
@@ -2907,7 +3176,6 @@ export class DeepSpaceEngine {
   private triggerHullStress(ctx: AudioContext, dest: AudioNode, start: number): number {
     const duration = 5.0;
     const rootFreq = 49 + Math.random() * 14;
-    const profile = CHANNEL_SPATIAL_PROFILES.hull;
     const trajectory = sampleHullSurroundingTrajectory(Math.random() < 0.35);
 
     const lp = ctx.createBiquadFilter();
@@ -2922,17 +3190,17 @@ export class DeepSpaceEngine {
     env.gain.linearRampToValueAtTime(0.085, start + 1.35);
     env.gain.exponentialRampToValueAtTime(0.0001, start + duration);
 
+    const spatialCfg = this.resolveChannelSpatial(
+      'hull',
+      trajectory.start,
+      trajectory.end,
+      960,
+    );
     const spatial = createSpatialBus(ctx, dest, {
-      startPos: trajectory.start,
-      endPos: trajectory.end,
+      ...spatialCfg,
       startTime: start,
       durationSec: duration,
       panningModel: 'HRTF',
-      refDistance: profile.refDistance,
-      maxDistance: profile.maxDistance,
-      rolloffFactor: profile.rolloffFactor,
-      distanceGain: profile.distanceGain,
-      airAbsorptionHz: computeDistanceLowpassHz(trajectory.start, 960),
     });
 
     const m1 = ctx.createOscillator();
@@ -3047,6 +3315,10 @@ export class DeepSpaceEngine {
     }
     this.channels = {};
 
+    if (this.reflectionBus) {
+      this.reflectionBus.disconnect();
+      this.reflectionBus = null;
+    }
     if (this.masterGain) {
       this.masterGain.disconnect();
       this.masterGain = null;
