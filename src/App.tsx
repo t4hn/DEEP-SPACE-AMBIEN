@@ -1,4 +1,4 @@
-import { createRef, useEffect, useReducer, useRef, useState } from 'react';
+import { createRef, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { AcousticProfileId } from './audio/acousticProfiles';
 import type { AmbientEventDescriptor } from './audio/ambientEvents';
 import { DeepSpaceEngine } from './audio/deepSpaceEngine';
@@ -10,18 +10,70 @@ import {
   createInitialMixerState,
   mixerReducer,
 } from './audio/mixerState';
+import {
+  DEFAULT_FADE_OUT_SEC,
+  type PlaybackPhase,
+  SLEEP_FADE_OUT_SEC,
+  type SleepTimerState,
+  activateArmedSleepTimer,
+  cancelSleepTimer,
+  createInitialSleepTimerState,
+  startOrSelectSleepTimer,
+  syncSleepTimerTick,
+} from './audio/sleepTimer';
 import { AcousticProfileSelector } from './components/AcousticProfileSelector';
 import { ChannelStrip } from './components/ChannelStrip';
 import { MasterControls } from './components/MasterControls';
+import { PlaybackTransitions } from './components/PlaybackTransitions';
 import { PresetSelector } from './components/PresetSelector';
 import { ShipTelemetry } from './components/ShipTelemetry';
+
+function readTestTransitionOverrides(): {
+  sleepTimerOverrideMs: number | null;
+  sleepFadeDurationSec: number;
+} {
+  if (typeof window === 'undefined') {
+    return {
+      sleepTimerOverrideMs: null,
+      sleepFadeDurationSec: SLEEP_FADE_OUT_SEC,
+    };
+  }
+  const params = new URLSearchParams(window.location.search);
+  const rawTimerSec = params.get('sleepTimerSec');
+  const rawFadeSec = params.get('sleepFadeSec');
+  const parsedTimerSec = rawTimerSec !== null ? Number(rawTimerSec) : NaN;
+  const parsedFadeSec = rawFadeSec !== null ? Number(rawFadeSec) : NaN;
+  return {
+    sleepTimerOverrideMs:
+      Number.isFinite(parsedTimerSec) && parsedTimerSec > 0
+        ? Math.round(parsedTimerSec * 1000)
+        : null,
+    sleepFadeDurationSec:
+      Number.isFinite(parsedFadeSec) && parsedFadeSec > 0
+        ? parsedFadeSec
+        : SLEEP_FADE_OUT_SEC,
+  };
+}
 
 export default function App() {
   const [state, dispatch] = useReducer(mixerReducer, undefined, createInitialMixerState);
   const [lastAmbientEvent, setLastAmbientEvent] = useState<AmbientEventDescriptor | null>(null);
+  const [playbackPhase, setPlaybackPhase] = useState<PlaybackPhase>('stopped');
+  const [activeFadeDurationSec, setActiveFadeDurationSec] = useState<number | undefined>(
+    undefined,
+  );
+  const [sleepTimer, setSleepTimer] = useState<SleepTimerState>(
+    createInitialSleepTimerState,
+  );
+
+  const testOverrides = useMemo(readTestTransitionOverrides, []);
+
   const engineRef = useRef<DeepSpaceEngine | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
+  const sleepTimerRef = useRef(sleepTimer);
+  sleepTimerRef.current = sleepTimer;
+  const pendingFadeOutSecRef = useRef<number | undefined>(undefined);
 
   const meterRefs = useRef<Record<ChannelId, React.RefObject<HTMLDivElement | null>>>({
     reactor: createRef<HTMLDivElement | null>(),
@@ -47,6 +99,10 @@ export default function App() {
       onAmbientEvent: (ev) => {
         setLastAmbientEvent(ev);
       },
+      onPlaybackPhaseChange: (phase, fadeSec) => {
+        setPlaybackPhase(phase);
+        setActiveFadeDurationSec(fadeSec);
+      },
     });
     engineRef.current = engine;
     return () => {
@@ -59,7 +115,12 @@ export default function App() {
   useEffect(() => {
     const engine = engineRef.current;
     if (!engine) return;
-    void engine.syncState(state);
+    const fadeOutDurationSec = pendingFadeOutSecRef.current;
+    pendingFadeOutSecRef.current = undefined;
+    void engine.syncState(
+      state,
+      fadeOutDurationSec !== undefined ? { fadeOutDurationSec } : undefined,
+    );
   }, [state]);
 
   // Clear recent event readout whenever Ambient Events are disabled or audio stops
@@ -68,6 +129,47 @@ export default function App() {
       setLastAmbientEvent(null);
     }
   }, [state.ambientEventsEnabled, state.isActive]);
+
+  // Reset sleep timer cleanly once its fade-out completes
+  useEffect(() => {
+    if (playbackPhase === 'stopped' && sleepTimerRef.current.status === 'fading-out') {
+      setSleepTimer(createInitialSleepTimerState());
+    }
+  }, [playbackPhase]);
+
+  // Deadline-based sleep timer ticker (resilient against tab throttling/sleep)
+  useEffect(() => {
+    if (sleepTimer.status !== 'running') {
+      return;
+    }
+
+    const evaluateTick = () => {
+      const { next, expired } = syncSleepTimerTick(sleepTimerRef.current, Date.now());
+      if (next !== sleepTimerRef.current) {
+        setSleepTimer(next);
+      }
+      if (expired) {
+        setLastAmbientEvent(null);
+        pendingFadeOutSecRef.current = testOverrides.sleepFadeDurationSec;
+        dispatch({ type: 'STOP_ALL' });
+      }
+    };
+
+    const intervalId = window.setInterval(evaluateTick, 250);
+    const handleVisibility = () => {
+      if (!document.hidden) {
+        evaluateTick();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('focus', evaluateTick);
+
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('focus', evaluateTick);
+    };
+  }, [sleepTimer.status, testOverrides.sleepFadeDurationSec]);
 
   // Lightweight direct-DOM meter updates only while audio environment is active
   useEffect(() => {
@@ -153,20 +255,48 @@ export default function App() {
     };
   }, [state.isActive, state.channels]);
 
+  const syncSleepTimerOnPlaybackStart = () => {
+    setSleepTimer((prev) => {
+      if (prev.status === 'armed') {
+        return activateArmedSleepTimer(prev, Date.now());
+      }
+      if (prev.status === 'fading-out') {
+        return createInitialSleepTimerState();
+      }
+      return prev;
+    });
+  };
+
   const handlePlayAll = () => {
     engineRef.current?.unlockFromGesture();
+    syncSleepTimerOnPlaybackStart();
     dispatch({ type: 'PLAY_ALL' });
   };
 
   const handleToggleChannel = (channelId: ChannelId) => {
-    if (!state.channels[channelId].enabled) {
+    const enabling = !state.channels[channelId].enabled;
+    if (enabling) {
       engineRef.current?.unlockFromGesture();
+      if (!state.isActive) {
+        syncSleepTimerOnPlaybackStart();
+      }
+    } else if (countEnabledChannels(state) <= 1) {
+      // Disabling the last active channel stops playback manually -> cancel active timer
+      setSleepTimer(cancelSleepTimer());
+      pendingFadeOutSecRef.current = DEFAULT_FADE_OUT_SEC;
     }
     dispatch({ type: 'TOGGLE_CHANNEL', channelId });
   };
 
   const handleSelectPreset = (presetId: PresetId) => {
     engineRef.current?.unlockFromGesture();
+    const nextState = mixerReducer(state, { type: 'SELECT_PRESET', presetId });
+    if (nextState.isActive && !state.isActive) {
+      syncSleepTimerOnPlaybackStart();
+    } else if (!nextState.isActive && state.isActive) {
+      setSleepTimer(cancelSleepTimer());
+      pendingFadeOutSecRef.current = DEFAULT_FADE_OUT_SEC;
+    }
     dispatch({ type: 'SELECT_PRESET', presetId });
   };
 
@@ -183,15 +313,47 @@ export default function App() {
 
   const handleStopAll = () => {
     setLastAmbientEvent(null);
+    setSleepTimer(cancelSleepTimer());
+    pendingFadeOutSecRef.current = DEFAULT_FADE_OUT_SEC;
     dispatch({ type: 'STOP_ALL' });
   };
 
   const handleReset = () => {
     setLastAmbientEvent(null);
+    setSleepTimer(cancelSleepTimer());
+    pendingFadeOutSecRef.current = DEFAULT_FADE_OUT_SEC;
     dispatch({ type: 'RESET' });
   };
 
+  const handleSelectSleepTimer = (durationMinutes: number) => {
+    setSleepTimer(
+      startOrSelectSleepTimer(
+        durationMinutes,
+        state.isActive,
+        Date.now(),
+        testOverrides.sleepTimerOverrideMs,
+      ),
+    );
+  };
+
+  const handleCancelSleepTimer = () => {
+    setSleepTimer(cancelSleepTimer());
+  };
+
   const activeChannelCount = countEnabledChannels(state);
+
+  let headerStatusLabel = state.isActive ? 'Active' : 'Standby';
+  let headerStatusColor = state.isActive ? 'text-emerald-400 font-medium' : 'text-amber-300 font-medium';
+  let headerStatusGlyph = state.isActive ? '●' : '◌';
+  let headerGlyphColor = state.isActive ? 'text-emerald-400' : 'text-amber-400';
+
+  if (playbackPhase === 'fading-in') {
+    headerStatusLabel = 'Fading In';
+  } else if (playbackPhase === 'fading-out') {
+    headerStatusLabel = 'Fading Out';
+    headerStatusColor = 'text-amber-300 font-medium';
+    headerGlyphColor = 'text-amber-400';
+  }
 
   return (
     <div className="min-h-screen bg-[#07090b] text-zinc-100 flex flex-col">
@@ -210,18 +372,14 @@ export default function App() {
           <div
             data-testid="environment-status"
             data-active={state.isActive ? 'true' : 'false'}
+            data-phase={playbackPhase}
             className="flex items-center gap-2.5 text-xs font-mono tabular-nums"
           >
-            <span
-              aria-hidden="true"
-              className={state.isActive ? 'text-emerald-400' : 'text-amber-400'}
-            >
-              {state.isActive ? '●' : '◌'}
+            <span aria-hidden="true" className={headerGlyphColor}>
+              {headerStatusGlyph}
             </span>
             <span className="text-zinc-400">Audio Environment:</span>
-            <span className={state.isActive ? 'text-emerald-400 font-medium' : 'text-amber-300 font-medium'}>
-              {state.isActive ? 'Active' : 'Standby'}
-            </span>
+            <span className={headerStatusColor}>{headerStatusLabel}</span>
           </div>
         </header>
 
@@ -250,6 +408,17 @@ export default function App() {
               dispatch({ type: 'SET_MASTER_VOLUME', volume })
             }
             onToggleAmbientEvents={handleToggleAmbientEvents}
+          />
+        </div>
+
+        {/* Playback Transitions & Sleep Timer */}
+        <div className="mb-3">
+          <PlaybackTransitions
+            playbackPhase={playbackPhase}
+            fadeDurationSec={activeFadeDurationSec}
+            sleepTimer={sleepTimer}
+            onSelectSleepTimer={handleSelectSleepTimer}
+            onCancelSleepTimer={handleCancelSleepTimer}
           />
         </div>
 

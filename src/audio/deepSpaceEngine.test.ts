@@ -456,9 +456,10 @@ test('CH-06 hull creaks & groans run when CH-06 is enabled with Ambient Events O
 
     const ctx = MockAudioContext.instances[0];
     assert.equal(ctx.panners.length, 6);
-    assert.equal(timers.size, 1, 'Expected one active CH-06 hull scheduler timer');
+    const hullTimersBefore = [...timers.entries()].filter(([, t]) => t.delay !== 3000);
+    assert.equal(hullTimersBefore.length, 1, 'Expected one active CH-06 hull scheduler timer');
 
-    const [firstTimerId, firstTimer] = [...timers.entries()][0];
+    const [firstTimerId, firstTimer] = hullTimersBefore[0];
     const initialNodeCount = ctx.nodes.length;
 
     // Advance fake clock past initial creak delay and fire timer
@@ -470,14 +471,19 @@ test('CH-06 hull creaks & groans run when CH-06 is enabled with Ambient Events O
     assert.ok(ctx.nodes.length > initialNodeCount, 'Expected CH-06 creak nodes to be created');
     assert.ok(ctx.panners.length > 6, 'Expected spatialized creak PannerNode');
     assert.equal(triggeredEvents.length, 0);
-    assert.equal(timers.size, 1, 'Expected next CH-06 wakeup timer to be scheduled');
+    const hullTimersAfterCreak = [...timers.entries()].filter(([, t]) => t.delay !== 3000);
+    assert.equal(hullTimersAfterCreak.length, 1, 'Expected next CH-06 wakeup timer to be scheduled');
 
     const transientNodes = ctx.nodes.slice(initialNodeCount);
 
-    // Backgrounding the tab must clear pending timer and stop active transient voices
+    // Backgrounding the tab must clear pending hull timer and stop active transient voices
     mockDoc.hidden = true;
     for (const cb of docListeners.visibilitychange ?? []) cb();
-    assert.equal(timers.size, 0, 'Expected pending CH-06 timer cleared when tab hidden');
+    assert.equal(
+      [...timers.values()].filter((t) => t.delay !== 3000).length,
+      0,
+      'Expected pending CH-06 timer cleared when tab hidden',
+    );
     for (const node of transientNodes) {
       if (node instanceof MockOscillatorNode) {
         assert.equal(node.stopped, true);
@@ -488,20 +494,29 @@ test('CH-06 hull creaks & groans run when CH-06 is enabled with Ambient Events O
     mockDoc.hidden = false;
     fakeNowMs += 120_000;
     for (const cb of docListeners.visibilitychange ?? []) cb();
-    assert.equal(timers.size, 1, 'Expected CH-06 timer re-scheduled on visibility return');
-    const [resumedId, resumedTimer] = [...timers.entries()][0];
+    const hullTimersResumed = [...timers.entries()].filter(([, t]) => t.delay !== 3000);
+    assert.equal(hullTimersResumed.length, 1, 'Expected CH-06 timer re-scheduled on visibility return');
+    const [resumedId, resumedTimer] = hullTimersResumed[0];
     assert.ok(resumedTimer.delay >= 1_000, 'Expected re-anchored delay instead of immediate burst');
 
-    // Turning CH-06 OFF clears its pending timer immediately (only 60ms AudioContext suspend timer may exist)
+    // Enabling Reactor alongside Hull keeps audio active; turning Hull OFF clears its timer immediately
+    state = mixerReducer(state, { type: 'TOGGLE_CHANNEL', channelId: 'reactor' });
+    await engine.syncState(state);
     state = mixerReducer(state, { type: 'TOGGLE_CHANNEL', channelId: 'hull' });
     await engine.syncState(state);
     assert.equal(timers.has(resumedId), false, 'Expected CH-06 timer cleared immediately on channel disable');
-    assert.equal(
-      [...timers.values()].every((t) => t.delay === 60),
-      true,
-      'Only 60ms AudioContext suspend timer may remain after last channel disables',
-    );
     assert.ok(clearedIds.includes(resumedId));
+
+    // Turning Reactor (last active channel) OFF schedules fade-out and leaves 0 timers once completed
+    const idsBeforeStop = new Set(timers.keys());
+    state = mixerReducer(state, { type: 'TOGGLE_CHANNEL', channelId: 'reactor' });
+    await engine.syncState(state);
+    const fadeOutIds = [...timers.keys()].filter((id) => !idsBeforeStop.has(id));
+    assert.equal(fadeOutIds.length, 1, 'Expected fade-out timer when last channel disables');
+    const fadeOutTimer = timers.get(fadeOutIds[0])!;
+    timers.delete(fadeOutIds[0]);
+    fadeOutTimer.fn();
+    assert.equal(timers.size, 0, 'Expected 0 timers remaining after fade-out completes');
   } finally {
     engine.dispose();
     Date.now = prevDateNow;
@@ -517,4 +532,263 @@ test('CH-06 hull creaks & groans run when CH-06 is enabled with Ambient Events O
     }
   }
 });
+
+test('fade-in ramps transitionGain over 3s without altering masterGain and does not re-trigger on additional channels', async () => {
+  const prevWindow = (globalThis as Record<string, unknown>).window;
+  let nextTimerId = 1;
+  const timers = new Map<number, { fn: () => void; delay: number }>();
+
+  MockAudioContext.instances = [];
+  (globalThis as Record<string, unknown>).window = {
+    AudioContext: MockAudioContext,
+    location: { search: '' },
+    setTimeout: (fn: () => void, delay = 0) => {
+      const id = nextTimerId++;
+      timers.set(id, { fn, delay });
+      return id;
+    },
+    clearTimeout: (id: number) => {
+      timers.delete(id);
+    },
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  };
+
+  const phases: string[] = [];
+  const engine = new DeepSpaceEngine({
+    onPlaybackPhaseChange: (phase) => phases.push(phase),
+  });
+
+  try {
+    let state = createInitialMixerState();
+    engine.unlockFromGesture();
+    state = mixerReducer(state, { type: 'TOGGLE_CHANNEL', channelId: 'reactor' });
+    await engine.syncState(state);
+
+    const ctx = MockAudioContext.instances[0];
+    // masterGain is node 0, transitionGain is node 1, compressor is node 2
+    const masterGain = ctx.nodes[0] as MockGainNode;
+    const transitionGain = ctx.nodes[1] as MockGainNode;
+    assert.ok(masterGain.connections.includes(transitionGain));
+
+    assert.equal(engine.getPlaybackPhase(), 'fading-in');
+    assert.deepEqual(phases, ['fading-in']);
+    const fadeInRamp = transitionGain.gain.calls.find(
+      (c) => c.method === 'linearRampToValueAtTime' && c.args[0] === 1,
+    );
+    assert.ok(fadeInRamp, 'Expected transitionGain linearRampToValueAtTime(1, now + 3)');
+    assert.equal(fadeInRamp.args[1], ctx.currentTime + 3);
+
+    // Master volume slider stays strictly on masterGain, never overwritten to 0 or 1 by fade
+    const masterTargetCall = masterGain.gain.calls.find(
+      (c) => c.method === 'setTargetAtTime',
+    );
+    assert.ok(masterTargetCall && masterTargetCall.args[0] > 0 && masterTargetCall.args[0] < 1);
+
+    const callsBeforeSecondChannel = transitionGain.gain.calls.length;
+
+    // Enabling a second channel during fade-in or active playback must NOT restart fade-in
+    ctx.currentTime += 1.0;
+    state = mixerReducer(state, { type: 'TOGGLE_CHANNEL', channelId: 'engines' });
+    await engine.syncState(state);
+    assert.equal(transitionGain.gain.calls.length, callsBeforeSecondChannel);
+
+    // Complete 3s fade-in timer -> transitions cleanly to active
+    const fadeTimer = [...timers.entries()].find(([, t]) => t.delay === 3000);
+    assert.ok(fadeTimer);
+    timers.delete(fadeTimer[0]);
+    fadeTimer[1].fn();
+    assert.equal(engine.getPlaybackPhase(), 'active');
+    assert.deepEqual(phases, ['fading-in', 'active']);
+
+    // Enabling a third channel while active also does NOT restart fade-in
+    const callsWhileActive = transitionGain.gain.calls.length;
+    ctx.currentTime += 2.0;
+    state = mixerReducer(state, { type: 'TOGGLE_CHANNEL', channelId: 'ventilation' });
+    await engine.syncState(state);
+    assert.equal(transitionGain.gain.calls.length, callsWhileActive);
+  } finally {
+    engine.dispose();
+    if (prevWindow === undefined) {
+      delete (globalThis as Record<string, unknown>).window;
+    } else {
+      (globalThis as Record<string, unknown>).window = prevWindow;
+    }
+  }
+});
+
+test('Stop All fades out over 8s before suspending AudioContext, and mid-fade Play All smoothly reverses transition', async () => {
+  const prevWindow = (globalThis as Record<string, unknown>).window;
+  let nextTimerId = 1;
+  const timers = new Map<number, { fn: () => void; delay: number }>();
+
+  MockAudioContext.instances = [];
+  (globalThis as Record<string, unknown>).window = {
+    AudioContext: MockAudioContext,
+    location: { search: '' },
+    setTimeout: (fn: () => void, delay = 0) => {
+      const id = nextTimerId++;
+      timers.set(id, { fn, delay });
+      return id;
+    },
+    clearTimeout: (id: number) => {
+      timers.delete(id);
+    },
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  };
+
+  const engine = new DeepSpaceEngine();
+
+  try {
+    let state = createInitialMixerState();
+    engine.unlockFromGesture();
+    state = mixerReducer(state, { type: 'PLAY_ALL' });
+    await engine.syncState(state);
+
+    const ctx = MockAudioContext.instances[0];
+    const transitionGain = ctx.nodes[1] as MockGainNode;
+
+    // Complete initial 3s fade-in
+    const fadeInEntry = [...timers.entries()].find(([, t]) => t.delay === 3000);
+    assert.ok(fadeInEntry);
+    timers.delete(fadeInEntry[0]);
+    fadeInEntry[1].fn();
+    ctx.currentTime += 3.0;
+    assert.equal(engine.getPlaybackPhase(), 'active');
+
+    // Trigger Stop All -> 8s fade-out begins, AudioContext remains running until fade completes
+    state = mixerReducer(state, { type: 'STOP_ALL' });
+    await engine.syncState(state);
+
+    assert.equal(engine.getPlaybackPhase(), 'fading-out');
+    assert.equal(ctx.state, 'running', 'AudioContext must not suspend before 8s fade completes');
+    const fadeOutRamp = transitionGain.gain.calls.find(
+      (c) => c.method === 'linearRampToValueAtTime' && c.args[0] === 0,
+    );
+    assert.ok(fadeOutRamp);
+    assert.equal(fadeOutRamp.args[1], ctx.currentTime + 8);
+
+    const stopTimerEntry = [...timers.entries()].find(([, t]) => t.delay === 8000);
+    assert.ok(stopTimerEntry, 'Expected 8000ms stop fade timer');
+
+    // Halfway through 8s fade-out (at +4s -> estimated gain 0.5), user clicks Play All to reverse
+    ctx.currentTime += 4.0;
+    state = mixerReducer(state, { type: 'PLAY_ALL' });
+    await engine.syncState(state);
+
+    assert.equal(timers.has(stopTimerEntry[0]), false, 'Pending stop timer must be cancelled');
+    assert.equal(engine.getPlaybackPhase(), 'fading-in');
+    assert.equal(ctx.state, 'running');
+
+    // Reversal starts from ~0.5 rather than snapping to 0, and completes over ~1.5s
+    const lastSet = [...transitionGain.gain.calls]
+      .reverse()
+      .find((c) => c.method === 'setValueAtTime');
+    const lastRamp = [...transitionGain.gain.calls]
+      .reverse()
+      .find((c) => c.method === 'linearRampToValueAtTime');
+    assert.ok(lastSet && Math.abs(lastSet.args[0] - 0.5) < 0.05);
+    assert.ok(lastRamp && lastRamp.args[0] === 1 && Math.abs(lastRamp.args[1] - (ctx.currentTime + 1.5)) < 0.05);
+
+    // Complete reversed fade-in, then test full 30s Sleep Timer fade-out completion
+    const reverseTimer = [...timers.entries()].find(([, t]) => t.delay === 1500);
+    assert.ok(reverseTimer);
+    timers.delete(reverseTimer[0]);
+    reverseTimer[1].fn();
+    ctx.currentTime += 1.5;
+    assert.equal(engine.getPlaybackPhase(), 'active');
+
+    state = mixerReducer(state, { type: 'STOP_ALL' });
+    await engine.syncState(state, { fadeOutDurationSec: 30 });
+    assert.equal(engine.getPlaybackPhase(), 'fading-out');
+    assert.equal(ctx.state, 'running');
+
+    const sleepFadeTimer = [...timers.entries()].find(([, t]) => t.delay === 30_000);
+    assert.ok(sleepFadeTimer, 'Expected 30000ms sleep timer fade-out timer');
+
+    // Fire sleep fade completion -> AudioContext suspends and phase becomes stopped
+    timers.delete(sleepFadeTimer[0]);
+    sleepFadeTimer[1].fn();
+    assert.equal(engine.getPlaybackPhase(), 'stopped');
+    assert.equal(ctx.state, 'suspended');
+  } finally {
+    engine.dispose();
+    if (prevWindow === undefined) {
+      delete (globalThis as Record<string, unknown>).window;
+    } else {
+      (globalThis as Record<string, unknown>).window = prevWindow;
+    }
+  }
+});
+
+test('rapid start/stop toggles cancel previous fade timers cleanly with zero duplicates', async () => {
+  const prevWindow = (globalThis as Record<string, unknown>).window;
+  let nextTimerId = 1;
+  const timers = new Map<number, { fn: () => void; delay: number }>();
+
+  MockAudioContext.instances = [];
+  (globalThis as Record<string, unknown>).window = {
+    AudioContext: MockAudioContext,
+    location: { search: '' },
+    setTimeout: (fn: () => void, delay = 0) => {
+      const id = nextTimerId++;
+      timers.set(id, { fn, delay });
+      return id;
+    },
+    clearTimeout: (id: number) => {
+      timers.delete(id);
+    },
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  };
+
+  const engine = new DeepSpaceEngine();
+
+  try {
+    let state = createInitialMixerState();
+    engine.unlockFromGesture();
+
+    let lastFadeOutTimerId: number | undefined;
+    for (let i = 0; i < 6; i += 1) {
+      state = mixerReducer(state, { type: 'PLAY_ALL' });
+      await engine.syncState(state);
+      ctxAdvance(0.2);
+      const beforeStop = new Set(timers.keys());
+      state = mixerReducer(state, { type: 'STOP_ALL' });
+      await engine.syncState(state);
+      const addedOnStop = [...timers.keys()].filter((id) => !beforeStop.has(id));
+      assert.equal(addedOnStop.length, 1);
+      lastFadeOutTimerId = addedOnStop[0];
+      ctxAdvance(0.2);
+    }
+
+    function ctxAdvance(sec: number) {
+      if (MockAudioContext.instances[0]) {
+        MockAudioContext.instances[0].currentTime += sec;
+      }
+    }
+
+    // 3 intermittent channel timers (systems, comms, hull) + 1 fade-out timer = 4 total (never stacked fade timers)
+    assert.equal(timers.size, 4);
+    assert.ok(lastFadeOutTimerId !== undefined && timers.has(lastFadeOutTimerId));
+    const fadeOutTimer = timers.get(lastFadeOutTimerId)!;
+    timers.delete(lastFadeOutTimerId);
+    fadeOutTimer.fn();
+    assert.equal(timers.size, 0, 'Fade-out completion must stop all channel schedulers and leave 0 timers');
+
+    // Dispose disconnects transitionGain and all channel nodes without leaks
+    engine.dispose();
+    const ctx = MockAudioContext.instances[0];
+    const leaked = ctx.nodes.filter((n) => !n.disconnected);
+    assert.equal(leaked.length, 0);
+  } finally {
+    if (prevWindow === undefined) {
+      delete (globalThis as Record<string, unknown>).window;
+    } else {
+      (globalThis as Record<string, unknown>).window = prevWindow;
+    }
+  }
+});
+
 

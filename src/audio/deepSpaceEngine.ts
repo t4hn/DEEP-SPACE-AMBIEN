@@ -48,6 +48,11 @@ import {
   getNextHullWakeDelayMs,
   reanchorHullScheduleAfterResume,
 } from './hullScheduler';
+import {
+  DEFAULT_FADE_IN_SEC,
+  DEFAULT_FADE_OUT_SEC,
+  type PlaybackPhase,
+} from './sleepTimer';
 
 interface ChannelAudioNodes {
   gain: GainNode;
@@ -99,6 +104,12 @@ interface AcousticReflectionBusHandle {
 
 export interface DeepSpaceEngineOptions {
   onAmbientEvent?: (event: AmbientEventDescriptor | null) => void;
+  onPlaybackPhaseChange?: (phase: PlaybackPhase, fadeDurationSec?: number) => void;
+}
+
+export interface SyncStateOptions {
+  fadeInDurationSec?: number;
+  fadeOutDurationSec?: number;
 }
 
 /**
@@ -572,6 +583,7 @@ class TransientVoicePool {
 export class DeepSpaceEngine {
   private ctx: AudioContext | null = null;
   private masterGain: GainNode | null = null;
+  private transitionGain: GainNode | null = null;
   private compressor: DynamicsCompressorNode | null = null;
   private reflectionBus: AcousticReflectionBusHandle | null = null;
   private channels: Partial<Record<ChannelId, ChannelAudioNodes>> = {};
@@ -581,6 +593,18 @@ export class DeepSpaceEngine {
   private latestState: MixerState | null = null;
   private suspendTimer: number | null = null;
   private disposed = false;
+
+  // Master playback transition (fade-in / fade-out) state
+  private playbackPhase: PlaybackPhase = 'stopped';
+  private fadeTimerId: number | null = null;
+  private fadeGeneration = 0;
+  private fadeRamp: {
+    startTime: number;
+    endTime: number;
+    startVal: number;
+    endVal: number;
+  } | null = null;
+  private onPlaybackPhaseChange?: (phase: PlaybackPhase, fadeDurationSec?: number) => void;
 
   // Optional procedural Ambient Event System state
   private onAmbientEvent?: (event: AmbientEventDescriptor | null) => void;
@@ -603,7 +627,16 @@ export class DeepSpaceEngine {
       return;
     }
 
-    if (!this.ctx || !this.latestState?.isActive) return;
+    if (!this.ctx) return;
+
+    if (this.playbackPhase === 'fading-out') {
+      if (this.ctx.state !== 'running') {
+        void this.ctx.resume().catch(() => {});
+      }
+      return;
+    }
+
+    if (!this.latestState?.isActive) return;
 
     if (this.ctx.state !== 'running') {
       void this.ctx.resume().catch(() => {
@@ -628,6 +661,7 @@ export class DeepSpaceEngine {
 
   constructor(options?: DeepSpaceEngineOptions) {
     this.onAmbientEvent = options?.onAmbientEvent;
+    this.onPlaybackPhaseChange = options?.onPlaybackPhaseChange;
 
     if (typeof window !== 'undefined') {
       const raw = new URLSearchParams(window.location.search).get('ambientEventMs');
@@ -666,6 +700,71 @@ export class DeepSpaceEngine {
     }
   }
 
+  private setPlaybackPhase(phase: PlaybackPhase, fadeDurationSec?: number): void {
+    this.playbackPhase = phase;
+    this.onPlaybackPhaseChange?.(phase, fadeDurationSec);
+  }
+
+  private clearFadeTimer(): void {
+    this.fadeGeneration += 1;
+    if (this.fadeTimerId !== null) {
+      window.clearTimeout(this.fadeTimerId);
+      this.fadeTimerId = null;
+    }
+  }
+
+  private getCurrentTransitionGain(now: number): number {
+    if (!this.transitionGain) return 0;
+    const paramVal = this.transitionGain.gain.value;
+    if (this.fadeRamp) {
+      const { startTime, endTime, startVal, endVal } = this.fadeRamp;
+      if (now >= endTime) {
+        return Math.max(0, Math.min(1, endVal));
+      }
+      if (now > startTime && endTime > startTime) {
+        if (paramVal > 0.0001 && paramVal < 0.9999 && Math.abs(paramVal - endVal) > 0.001) {
+          return Math.max(0, Math.min(1, paramVal));
+        }
+        const progress = (now - startTime) / (endTime - startTime);
+        return Math.max(0, Math.min(1, startVal + (endVal - startVal) * progress));
+      }
+    }
+    return Math.max(0, Math.min(1, paramVal));
+  }
+
+  private performStopCleanup(ctx: AudioContext): void {
+    this.stopAmbientEvents(true);
+    this.channels.systems?.stop?.();
+    this.channels.communications?.stop?.();
+    this.channels.hull?.stop?.();
+
+    const now = ctx.currentTime;
+    if (this.transitionGain) {
+      this.transitionGain.gain.cancelScheduledValues(now);
+      this.transitionGain.gain.setValueAtTime(0, now);
+    }
+    this.fadeRamp = null;
+
+    if (this.masterGain) {
+      this.masterGain.gain.cancelScheduledValues(now);
+      this.masterGain.gain.setValueAtTime(0, now);
+    }
+
+    for (const ch of CHANNELS) {
+      const node = this.channels[ch.id];
+      if (!node) continue;
+      node.gain.gain.cancelScheduledValues(now);
+      node.gain.gain.setValueAtTime(0, now);
+    }
+
+    this.setPlaybackPhase('stopped');
+    this.clearPendingSuspend();
+
+    if (!this.disposed && !this.latestState?.isActive && ctx.state === 'running') {
+      void ctx.suspend().catch(() => {});
+    }
+  }
+
   private ensureInitialized(): AudioContext {
     if (this.ctx) {
       return this.ctx;
@@ -679,7 +778,7 @@ export class DeepSpaceEngine {
     ctx.onstatechange = () => {
       if (
         !this.disposed &&
-        this.latestState?.isActive &&
+        (this.latestState?.isActive || this.playbackPhase === 'fading-out') &&
         (ctx.state === 'suspended' || (ctx.state as string) === 'interrupted') &&
         (typeof document === 'undefined' || !document.hidden)
       ) {
@@ -690,6 +789,11 @@ export class DeepSpaceEngine {
     const masterGain = ctx.createGain();
     masterGain.gain.value = 0;
 
+    // Dedicated master transition gain stage downstream of masterGain so fade-in/fade-out
+    // never alter or overwrite the user's masterVolume slider or channel mix.
+    const transitionGain = ctx.createGain();
+    transitionGain.gain.value = 0;
+
     // Gentle transparent mastering compressor so all 6 channels blend without clipping
     const compressor = ctx.createDynamicsCompressor();
     compressor.threshold.value = -12;
@@ -698,7 +802,8 @@ export class DeepSpaceEngine {
     compressor.attack.value = 0.015;
     compressor.release.value = 0.3;
 
-    masterGain.connect(compressor);
+    masterGain.connect(transitionGain);
+    transitionGain.connect(compressor);
     compressor.connect(ctx.destination);
 
     configureSpatialListener(ctx);
@@ -710,6 +815,7 @@ export class DeepSpaceEngine {
 
     this.ctx = ctx;
     this.masterGain = masterGain;
+    this.transitionGain = transitionGain;
     this.compressor = compressor;
     this.reflectionBus = createAcousticReflectionBus(ctx, masterGain, initialProfile);
 
@@ -2856,7 +2962,11 @@ export class DeepSpaceEngine {
     };
   }
 
-  public async syncState(state: MixerState): Promise<void> {
+  public getPlaybackPhase(): PlaybackPhase {
+    return this.playbackPhase;
+  }
+
+  public async syncState(state: MixerState, options?: SyncStateOptions): Promise<void> {
     if (this.disposed) return;
     this.latestState = state;
 
@@ -2867,7 +2977,6 @@ export class DeepSpaceEngine {
     }
 
     const ctx = this.ensureInitialized();
-    const now = ctx.currentTime;
 
     if (state.acousticProfileId !== this.activeAcousticProfileId) {
       this.applyAcousticProfile(state.acousticProfileId);
@@ -2875,12 +2984,54 @@ export class DeepSpaceEngine {
 
     if (state.isActive) {
       this.clearPendingSuspend();
+      const startingFromInactive =
+        this.playbackPhase === 'stopped' || this.playbackPhase === 'fading-out';
+
       if (ctx.state === 'suspended' || (ctx.state as string) === 'interrupted') {
         try {
           await ctx.resume();
         } catch {
           // Will recover on next gesture or visibility restore
         }
+      }
+
+      if (this.disposed || !this.latestState?.isActive) {
+        return;
+      }
+
+      const now = ctx.currentTime;
+
+      if (startingFromInactive) {
+        this.clearFadeTimer();
+        const tg = this.transitionGain;
+        const currentGain = this.getCurrentTransitionGain(now);
+        const fullFadeInSec = Math.max(0.05, options?.fadeInDurationSec ?? DEFAULT_FADE_IN_SEC);
+        const remainingRatio = Math.max(0, 1 - currentGain);
+        const fadeInSec =
+          remainingRatio <= 0.001 ? 0.05 : Math.max(0.05, fullFadeInSec * remainingRatio);
+
+        if (tg) {
+          tg.gain.cancelScheduledValues(now);
+          tg.gain.setValueAtTime(currentGain, now);
+          tg.gain.linearRampToValueAtTime(1, now + fadeInSec);
+          this.fadeRamp = {
+            startTime: now,
+            endTime: now + fadeInSec,
+            startVal: currentGain,
+            endVal: 1,
+          };
+        }
+
+        this.setPlaybackPhase('fading-in', fadeInSec);
+        const gen = this.fadeGeneration;
+        this.fadeTimerId = window.setTimeout(() => {
+          this.fadeTimerId = null;
+          if (this.disposed || gen !== this.fadeGeneration) return;
+          this.fadeRamp = null;
+          if (this.latestState?.isActive) {
+            this.setPlaybackPhase('active');
+          }
+        }, Math.round(fadeInSec * 1000));
       }
 
       const targetMaster = sliderToGain(state.masterVolume);
@@ -2926,34 +3077,48 @@ export class DeepSpaceEngine {
         }
       }
     } else {
-      // Stop All / last channel turned off: stop intermittent schedulers and ambient events immediately,
-      // perform a fast 40ms click-free fade to exact 0, and suspend AudioContext.
-      this.stopAmbientEvents(true);
-      this.channels.systems?.stop?.();
-      this.channels.communications?.stop?.();
-      this.channels.hull?.stop?.();
-
-      if (this.masterGain) {
-        this.masterGain.gain.cancelScheduledValues(now);
-        this.masterGain.gain.setValueAtTime(this.masterGain.gain.value, now);
-        this.masterGain.gain.linearRampToValueAtTime(0, now + 0.04);
+      if (this.playbackPhase === 'stopped') {
+        return;
       }
 
-      for (const ch of CHANNELS) {
-        const node = this.channels[ch.id];
-        if (!node) continue;
-        node.gain.gain.cancelScheduledValues(now);
-        node.gain.gain.setValueAtTime(node.gain.gain.value, now);
-        node.gain.gain.linearRampToValueAtTime(0, now + 0.04);
+      // If already fading out and no explicit new fade duration was requested,
+      // keep the active fade-out countdown intact rather than resetting it.
+      if (this.playbackPhase === 'fading-out' && options?.fadeOutDurationSec === undefined) {
+        return;
       }
 
+      const now = ctx.currentTime;
+      const currentGain = this.getCurrentTransitionGain(now);
+      const fullFadeOutSec = Math.max(
+        0.05,
+        options?.fadeOutDurationSec ?? DEFAULT_FADE_OUT_SEC,
+      );
+      const fadeOutSec =
+        currentGain <= 0.001 ? 0.05 : Math.max(0.05, fullFadeOutSec * currentGain);
+
+      this.clearFadeTimer();
       this.clearPendingSuspend();
-      this.suspendTimer = window.setTimeout(() => {
-        this.suspendTimer = null;
-        if (!this.disposed && this.ctx && !this.latestState?.isActive && this.ctx.state === 'running') {
-          void this.ctx.suspend().catch(() => {});
-        }
-      }, 60);
+
+      const tg = this.transitionGain;
+      if (tg) {
+        tg.gain.cancelScheduledValues(now);
+        tg.gain.setValueAtTime(currentGain, now);
+        tg.gain.linearRampToValueAtTime(0, now + fadeOutSec);
+        this.fadeRamp = {
+          startTime: now,
+          endTime: now + fadeOutSec,
+          startVal: currentGain,
+          endVal: 0,
+        };
+      }
+
+      this.setPlaybackPhase('fading-out', fadeOutSec);
+      const gen = this.fadeGeneration;
+      this.fadeTimerId = window.setTimeout(() => {
+        this.fadeTimerId = null;
+        if (this.disposed || gen !== this.fadeGeneration || !this.ctx) return;
+        this.performStopCleanup(this.ctx);
+      }, Math.round(fadeOutSec * 1000));
     }
   }
 
@@ -3674,6 +3839,9 @@ export class DeepSpaceEngine {
 
   public dispose(): void {
     this.disposed = true;
+    this.clearFadeTimer();
+    this.fadeRamp = null;
+    this.playbackPhase = 'stopped';
     this.clearPendingSuspend();
     this.stopAmbientEvents(true);
     this.eventNoiseBuf = null;
@@ -3697,6 +3865,10 @@ export class DeepSpaceEngine {
     if (this.masterGain) {
       this.masterGain.disconnect();
       this.masterGain = null;
+    }
+    if (this.transitionGain) {
+      this.transitionGain.disconnect();
+      this.transitionGain = null;
     }
     if (this.compressor) {
       this.compressor.disconnect();
