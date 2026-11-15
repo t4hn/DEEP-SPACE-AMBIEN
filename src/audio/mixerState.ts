@@ -5,12 +5,27 @@ export type ChannelId =
   | 'systems'
   | 'communications';
 
+export type PresetId =
+  | 'deep-transit'
+  | 'research-station'
+  | 'silent-watch'
+  | 'engineering-deck';
+
+export type ActivePresetState = PresetId | 'custom' | null;
+
 export interface ChannelMeta {
   id: ChannelId;
   code: string;
   name: string;
   description: string;
   defaultVolume: number;
+}
+
+export interface EnvironmentPreset {
+  id: PresetId;
+  name: string;
+  description: string;
+  volumes: Record<ChannelId, number>;
 }
 
 export interface ChannelState {
@@ -20,6 +35,7 @@ export interface ChannelState {
 
 export interface MixerState {
   isActive: boolean;
+  activePresetId: ActivePresetState;
   masterVolume: number; // 0..1 linear slider value
   channels: Record<ChannelId, ChannelState>;
 }
@@ -62,11 +78,63 @@ export const CHANNELS: readonly ChannelMeta[] = [
   },
 ] as const;
 
+export const ENVIRONMENT_PRESETS: readonly EnvironmentPreset[] = [
+  {
+    id: 'deep-transit',
+    name: 'Deep Transit',
+    description: 'High-thrust cruise with dominant drive rumble',
+    volumes: {
+      reactor: 0.65,
+      engines: 0.85,
+      ventilation: 0.3,
+      systems: 0.15,
+      communications: 0.1,
+    },
+  },
+  {
+    id: 'research-station',
+    name: 'Research Station',
+    description: 'Balanced orbital lab with steady airflow and telemetry',
+    volumes: {
+      reactor: 0.65,
+      engines: 0.1,
+      ventilation: 0.65,
+      systems: 0.45,
+      communications: 0.25,
+    },
+  },
+  {
+    id: 'silent-watch',
+    name: 'Silent Watch',
+    description: 'Low-output night watch with propulsion offline',
+    volumes: {
+      reactor: 0.3,
+      engines: 0,
+      ventilation: 0.15,
+      systems: 0.05,
+      communications: 0.1,
+    },
+  },
+  {
+    id: 'engineering-deck',
+    name: 'Engineering Deck',
+    description: 'Heavy core output and high-volume air circulation',
+    volumes: {
+      reactor: 0.9,
+      engines: 0.55,
+      ventilation: 0.85,
+      systems: 0.35,
+      communications: 0.05,
+    },
+  },
+] as const;
+
 export const DEFAULT_MASTER_VOLUME = 0.8;
 
 export function createInitialMixerState(): MixerState {
   return {
     isActive: false,
+    activePresetId: null,
     masterVolume: DEFAULT_MASTER_VOLUME,
     channels: {
       reactor: { enabled: false, volume: 0.75 },
@@ -82,6 +150,7 @@ export type MixerAction =
   | { type: 'PLAY_ALL' }
   | { type: 'STOP_ALL' }
   | { type: 'RESET' }
+  | { type: 'SELECT_PRESET'; presetId: PresetId }
   | { type: 'TOGGLE_CHANNEL'; channelId: ChannelId }
   | { type: 'SET_CHANNEL_VOLUME'; channelId: ChannelId; volume: number }
   | { type: 'SET_MASTER_VOLUME'; volume: number };
@@ -122,7 +191,11 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
   switch (action.type) {
     case 'PLAY_ALL': {
       const nextChannels = { ...state.channels };
+      let changedFromState = false;
       for (const ch of CHANNELS) {
+        if (!nextChannels[ch.id].enabled) {
+          changedFromState = true;
+        }
         nextChannels[ch.id] = {
           ...nextChannels[ch.id],
           enabled: true,
@@ -131,6 +204,8 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
       return {
         ...state,
         isActive: true,
+        activePresetId:
+          state.activePresetId !== null && changedFromState ? 'custom' : state.activePresetId,
         channels: nextChannels,
       };
     }
@@ -146,6 +221,7 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
       return {
         ...state,
         isActive: false,
+        activePresetId: null,
         channels: nextChannels,
       };
     }
@@ -155,7 +231,7 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
       if (!state.isActive) {
         return defaults;
       }
-      // When already listening, restore the balanced default 5-channel mix cleanly.
+      // When already listening, restore the balanced default 5-channel mix and clear preset.
       const activeDefaultChannels = { ...defaults.channels };
       for (const ch of CHANNELS) {
         activeDefaultChannels[ch.id] = {
@@ -165,8 +241,31 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
       }
       return {
         isActive: true,
+        activePresetId: null,
         masterVolume: defaults.masterVolume,
         channels: activeDefaultChannels,
+      };
+    }
+
+    case 'SELECT_PRESET': {
+      const preset = ENVIRONMENT_PRESETS.find((p) => p.id === action.presetId);
+      if (!preset) return state;
+
+      const nextChannels = { ...state.channels };
+      for (const ch of CHANNELS) {
+        const volume = clampUnit(preset.volumes[ch.id]);
+        nextChannels[ch.id] = {
+          volume,
+          enabled: volume > 0,
+        };
+      }
+
+      const anyEnabled = CHANNELS.some((ch) => nextChannels[ch.id].enabled);
+      return {
+        ...state,
+        isActive: anyEnabled,
+        activePresetId: preset.id,
+        channels: nextChannels,
       };
     }
 
@@ -184,6 +283,7 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
       return {
         ...state,
         isActive: anyEnabled,
+        activePresetId: state.activePresetId !== null ? 'custom' : null,
         channels: nextChannels,
       };
     }
@@ -192,6 +292,7 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
       const nextVolume = clampUnit(action.volume);
       return {
         ...state,
+        activePresetId: state.activePresetId !== null ? 'custom' : null,
         channels: {
           ...state.channels,
           [action.channelId]: {

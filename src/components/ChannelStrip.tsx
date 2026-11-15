@@ -26,7 +26,7 @@ export function ChannelStrip({
     <div
       data-testid={`channel-strip-${meta.id}`}
       data-enabled={state.enabled ? 'true' : 'false'}
-      className={`border px-5 py-4 sm:px-6 transition-colors ${
+      className={`border px-5 py-3.5 sm:px-6 transition-colors ${
         isChannelActive
           ? 'bg-[#0e1418] border-emerald-800/60'
           : 'bg-[#0c1014] border-zinc-800/90'

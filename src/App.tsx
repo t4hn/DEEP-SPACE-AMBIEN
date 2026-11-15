@@ -3,12 +3,14 @@ import { DeepSpaceEngine } from './audio/deepSpaceEngine';
 import {
   CHANNELS,
   type ChannelId,
+  type PresetId,
   countEnabledChannels,
   createInitialMixerState,
   mixerReducer,
 } from './audio/mixerState';
 import { ChannelStrip } from './components/ChannelStrip';
 import { MasterControls } from './components/MasterControls';
+import { PresetSelector } from './components/PresetSelector';
 
 export default function App() {
   const [state, dispatch] = useReducer(mixerReducer, undefined, createInitialMixerState);
@@ -122,13 +124,18 @@ export default function App() {
     dispatch({ type: 'TOGGLE_CHANNEL', channelId });
   };
 
+  const handleSelectPreset = (presetId: PresetId) => {
+    engineRef.current?.unlockFromGesture();
+    dispatch({ type: 'SELECT_PRESET', presetId });
+  };
+
   const activeChannelCount = countEnabledChannels(state);
 
   return (
     <div className="min-h-screen bg-[#07090b] text-zinc-100 flex flex-col">
-      <main className="w-full max-w-5xl mx-auto px-4 py-6 sm:px-8 sm:py-10 flex-1 flex flex-col justify-center">
+      <main className="w-full max-w-5xl mx-auto px-4 py-5 sm:px-8 sm:py-6 flex-1 flex flex-col justify-center">
         {/* Console Header */}
-        <header className="flex flex-col gap-3 pb-5 mb-6 border-b border-zinc-800/90 sm:flex-row sm:items-end sm:justify-between">
+        <header className="flex flex-col gap-3 pb-4 mb-4 border-b border-zinc-800/90 sm:flex-row sm:items-end sm:justify-between">
           <div>
             <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-zinc-100">
               DEEP SPACE
@@ -157,7 +164,7 @@ export default function App() {
         </header>
 
         {/* Master Controls */}
-        <div className="mb-5">
+        <div className="mb-3.5">
           <MasterControls
             isActive={state.isActive}
             masterVolume={state.masterVolume}
@@ -172,8 +179,16 @@ export default function App() {
           />
         </div>
 
+        {/* Compact Environment Presets */}
+        <div className="mb-3.5">
+          <PresetSelector
+            activePresetId={state.activePresetId}
+            onSelectPreset={handleSelectPreset}
+          />
+        </div>
+
         {/* Five Independent Audio Channels */}
-        <section aria-label="Audio Channels" className="flex flex-col gap-3">
+        <section aria-label="Audio Channels" className="flex flex-col gap-2.5">
           {CHANNELS.map((ch) => (
             <ChannelStrip
               key={ch.id}
