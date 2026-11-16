@@ -20,6 +20,7 @@ import {
   createInitialMixerState,
   mixerReducer,
 } from './audio/mixerState';
+import { type AppSectionId, DEFAULT_SECTION_ID } from './audio/navigation';
 import {
   DEFAULT_FADE_OUT_SEC,
   type PlaybackPhase,
@@ -32,8 +33,11 @@ import {
   syncSleepTimerTick,
 } from './audio/sleepTimer';
 import { AcousticProfileSelector } from './components/AcousticProfileSelector';
+import { AmbientEventsPanel } from './components/AmbientEventsPanel';
 import { ChannelStrip } from './components/ChannelStrip';
 import { MasterControls } from './components/MasterControls';
+import { DesktopNavigation, MobileBottomNavigation } from './components/NavigationBar';
+import { PersistentPlaybackBar } from './components/PersistentPlaybackBar';
 import { PlaybackTransitions } from './components/PlaybackTransitions';
 import { PresetSelector } from './components/PresetSelector';
 import { ShipTelemetry } from './components/ShipTelemetry';
@@ -66,6 +70,7 @@ function readTestTransitionOverrides(): {
 }
 
 export default function App() {
+  const [activeSection, setActiveSection] = useState<AppSectionId>(DEFAULT_SECTION_ID);
   const [state, dispatch] = useReducer(mixerReducer, undefined, createInitialMixerState);
   const [lastAmbientEvent, setLastAmbientEvent] = useState<AmbientEventDescriptor | null>(null);
   const [playbackPhase, setPlaybackPhase] = useState<PlaybackPhase>('stopped');
@@ -106,7 +111,7 @@ export default function App() {
     hull: createRef<HTMLDivElement | null>(),
   });
 
-  // Lazily create engine and dispose on unmount
+  // Lazily create engine and dispose on unmount (remains alive across section navigation)
   useEffect(() => {
     const engine = new DeepSpaceEngine({
       onAmbientEvent: (ev) => {
@@ -184,7 +189,7 @@ export default function App() {
     };
   }, [sleepTimer.status, testOverrides.sleepFadeDurationSec]);
 
-  // Lightweight direct-DOM meter updates only while audio environment is active
+  // Lightweight direct-DOM meter updates while audio environment is active
   useEffect(() => {
     const prefersReducedMotion =
       typeof window !== 'undefined' &&
@@ -266,7 +271,14 @@ export default function App() {
         window.cancelAnimationFrame(rafId);
       }
     };
-  }, [state.isActive, state.channels]);
+  }, [state.isActive, state.channels, activeSection]);
+
+  const handleSelectSection = (sectionId: AppSectionId) => {
+    setActiveSection(sectionId);
+    if (typeof window !== 'undefined') {
+      window.scrollTo({ top: 0, behavior: 'auto' });
+    }
+  };
 
   const syncSleepTimerOnPlaybackStart = () => {
     setSleepTimer((prev) => {
@@ -396,6 +408,10 @@ export default function App() {
     setSleepTimer(cancelSleepTimer());
   };
 
+  const handleMasterVolumeChange = (volume: number) => {
+    dispatch({ type: 'SET_MASTER_VOLUME', volume });
+  };
+
   const activeChannelCount = countEnabledChannels(state);
 
   let headerStatusLabel = state.isActive ? 'Active' : 'Standby';
@@ -413,14 +429,19 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#07090b] text-zinc-100 flex flex-col">
-      <main className="w-full max-w-5xl mx-auto px-4 py-4 sm:px-8 sm:py-4 flex-1 flex flex-col justify-center">
-        {/* Console Header */}
-        <header className="flex flex-col gap-2 pb-3 mb-3 border-b border-zinc-800/90 sm:flex-row sm:items-end sm:justify-between">
+      <main className="w-full max-w-5xl mx-auto px-4 pt-4 pb-36 sm:px-8 sm:pt-5 md:pb-20 flex-1 flex flex-col">
+        {/* Compact Vessel Identity & Playback Status Header */}
+        <header className="flex flex-col gap-1.5 pb-3 mb-3 border-b border-zinc-800/90 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-zinc-100">
-              DEEP SPACE
-            </h1>
-            <p className="mt-0.5 text-xs font-mono tracking-[0.18em] text-zinc-400">
+            <div className="flex items-baseline gap-2.5">
+              <h1 className="text-xl sm:text-2xl font-semibold tracking-tight text-zinc-100">
+                DEEP SPACE
+              </h1>
+              <span className="text-xs font-mono text-emerald-400/90 tabular-nums">
+                DSV-01
+              </span>
+            </div>
+            <p className="mt-0.5 text-[11px] font-mono tracking-[0.16em] text-zinc-400">
               SHIPBOARD AUDIO ENVIRONMENT
             </p>
           </div>
@@ -429,7 +450,7 @@ export default function App() {
             data-testid="environment-status"
             data-active={state.isActive ? 'true' : 'false'}
             data-phase={playbackPhase}
-            className="flex items-center gap-2.5 text-xs font-mono tabular-nums"
+            className="flex items-center gap-2 text-xs font-mono tabular-nums"
           >
             <span aria-hidden="true" className={headerGlyphColor}>
               {headerStatusGlyph}
@@ -439,88 +460,126 @@ export default function App() {
           </div>
         </header>
 
-        {/* Ship Telemetry Dashboard */}
-        <div className="mb-3">
-          <ShipTelemetry
-            state={state}
-            lastAmbientEvent={lastAmbientEvent}
-            telemetryMeterRefs={telemetryMeterRefs.current}
+        {/* Desktop Horizontal Navigation */}
+        <div className="hidden md:block mb-3">
+          <DesktopNavigation
+            activeSection={activeSection}
+            onSelectSection={handleSelectSection}
           />
         </div>
 
-        {/* Master Controls */}
-        <div className="mb-3">
-          <MasterControls
-            isActive={state.isActive}
-            masterVolume={state.masterVolume}
-            activeChannelCount={activeChannelCount}
-            totalChannels={CHANNELS.length}
-            ambientEventsEnabled={state.ambientEventsEnabled}
-            lastAmbientEvent={lastAmbientEvent}
-            onPlayAll={handlePlayAll}
-            onStopAll={handleStopAll}
-            onReset={handleReset}
-            onMasterVolumeChange={(volume) =>
-              dispatch({ type: 'SET_MASTER_VOLUME', volume })
-            }
-            onToggleAmbientEvents={handleToggleAmbientEvents}
-          />
-        </div>
-
-        {/* Playback Transitions & Sleep Timer */}
-        <div className="mb-3">
-          <PlaybackTransitions
-            playbackPhase={playbackPhase}
-            fadeDurationSec={activeFadeDurationSec}
-            sleepTimer={sleepTimer}
-            onSelectSleepTimer={handleSelectSleepTimer}
-            onCancelSleepTimer={handleCancelSleepTimer}
-          />
-        </div>
-
-        {/* Compact Environment Presets & Custom Soundscapes */}
-        <div className="mb-3">
-          <PresetSelector
-            activePresetId={state.activePresetId}
-            activeCustomSoundscapeId={state.activeCustomSoundscapeId}
-            customSoundscapes={customSoundscapes}
-            onSelectPreset={handleSelectPreset}
-            onLoadCustomSoundscape={handleLoadCustomSoundscape}
-            onSaveCustomSoundscape={handleSaveCustomSoundscape}
-            onUpdateCustomSoundscape={handleUpdateCustomSoundscape}
-            onDeleteCustomSoundscape={handleDeleteCustomSoundscape}
-          />
-        </div>
-
-        {/* Acoustic Environment Profiles */}
-        <div className="mb-3">
-          <AcousticProfileSelector
-            activeProfileId={state.acousticProfileId}
-            onSelectProfile={handleSelectAcousticProfile}
-          />
-        </div>
-
-        {/* Six Independent Audio Channels */}
-        <section aria-label="Audio Channels" className="flex flex-col gap-2">
-          {CHANNELS.map((ch) => (
-            <ChannelStrip
-              key={ch.id}
-              meta={ch}
-              state={state.channels[ch.id]}
-              environmentActive={state.isActive}
-              meterRef={meterRefs.current[ch.id]}
-              onToggle={() => handleToggleChannel(ch.id)}
-              onVolumeChange={(volume) =>
-                dispatch({
-                  type: 'SET_CHANNEL_VOLUME',
-                  channelId: ch.id,
-                  volume,
-                })
-              }
+        {/* Section 1: CONSOLE (Default) */}
+        {activeSection === 'console' && (
+          <div data-testid="section-console" className="flex flex-col gap-3">
+            {/* Master Output Controls */}
+            <MasterControls
+              isActive={state.isActive}
+              masterVolume={state.masterVolume}
+              activeChannelCount={activeChannelCount}
+              totalChannels={CHANNELS.length}
+              onPlayAll={handlePlayAll}
+              onStopAll={handleStopAll}
+              onReset={handleReset}
+              onMasterVolumeChange={handleMasterVolumeChange}
             />
-          ))}
-        </section>
+
+            {/* Playback Transitions & Sleep Timer */}
+            <PlaybackTransitions
+              playbackPhase={playbackPhase}
+              fadeDurationSec={activeFadeDurationSec}
+              sleepTimer={sleepTimer}
+              onSelectSleepTimer={handleSelectSleepTimer}
+              onCancelSleepTimer={handleCancelSleepTimer}
+            />
+
+            {/* Ambient Events */}
+            <AmbientEventsPanel
+              isActive={state.isActive}
+              ambientEventsEnabled={state.ambientEventsEnabled}
+              lastAmbientEvent={lastAmbientEvent}
+              onToggleAmbientEvents={handleToggleAmbientEvents}
+            />
+
+            {/* Channel Mixer: Six Independent Audio Channels */}
+            <section aria-label="Audio Channels" className="flex flex-col gap-2">
+              {CHANNELS.map((ch) => (
+                <ChannelStrip
+                  key={ch.id}
+                  meta={ch}
+                  state={state.channels[ch.id]}
+                  environmentActive={state.isActive}
+                  meterRef={meterRefs.current[ch.id]}
+                  onToggle={() => handleToggleChannel(ch.id)}
+                  onVolumeChange={(volume) =>
+                    dispatch({
+                      type: 'SET_CHANNEL_VOLUME',
+                      channelId: ch.id,
+                      volume,
+                    })
+                  }
+                />
+              ))}
+            </section>
+          </div>
+        )}
+
+        {/* Section 2: ENVIRONMENTS */}
+        {activeSection === 'environments' && (
+          <div data-testid="section-environments" className="flex flex-col gap-3">
+            <PresetSelector
+              activePresetId={state.activePresetId}
+              activeCustomSoundscapeId={state.activeCustomSoundscapeId}
+              customSoundscapes={customSoundscapes}
+              onSelectPreset={handleSelectPreset}
+              onLoadCustomSoundscape={handleLoadCustomSoundscape}
+              onSaveCustomSoundscape={handleSaveCustomSoundscape}
+              onUpdateCustomSoundscape={handleUpdateCustomSoundscape}
+              onDeleteCustomSoundscape={handleDeleteCustomSoundscape}
+            />
+
+            <AcousticProfileSelector
+              activeProfileId={state.acousticProfileId}
+              onSelectProfile={handleSelectAcousticProfile}
+            />
+          </div>
+        )}
+
+        {/* Section 3: SHIP STATUS */}
+        {activeSection === 'ship-status' && (
+          <div data-testid="section-ship-status" className="flex flex-col gap-3">
+            <ShipTelemetry
+              state={state}
+              lastAmbientEvent={lastAmbientEvent}
+              telemetryMeterRefs={telemetryMeterRefs.current}
+            />
+          </div>
+        )}
       </main>
+
+      {/* Persistent Bottom Controls: Desktop Footer Bar / Mobile Playback Bar + Bottom Nav */}
+      <div className="fixed bottom-0 inset-x-0 z-40">
+        <PersistentPlaybackBar
+          isActive={state.isActive}
+          playbackPhase={playbackPhase}
+          fadeDurationSec={activeFadeDurationSec}
+          masterVolume={state.masterVolume}
+          activeChannelCount={activeChannelCount}
+          totalChannels={CHANNELS.length}
+          sleepTimer={sleepTimer}
+          onPlayAll={handlePlayAll}
+          onStopAll={handleStopAll}
+          onMasterVolumeChange={handleMasterVolumeChange}
+          onSelectSleepTimer={handleSelectSleepTimer}
+          onCancelSleepTimer={handleCancelSleepTimer}
+        />
+
+        <div className="md:hidden">
+          <MobileBottomNavigation
+            activeSection={activeSection}
+            onSelectSection={handleSelectSection}
+          />
+        </div>
+      </div>
     </div>
   );
 }

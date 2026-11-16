@@ -512,7 +512,7 @@ export function PresetSelector({
                         {soundscape.description}
                       </p>
                     )}
-                    <p className="mt-1 text-[10px] font-mono text-zinc-500 truncate w-full">
+                    <p className="mt-1 text-[10px] font-mono text-zinc-500 leading-relaxed sm:truncate w-full">
                       {summarizeSoundscapeConfig(soundscape)}
                     </p>
                   </button>
