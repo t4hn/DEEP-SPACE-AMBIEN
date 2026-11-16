@@ -3,6 +3,7 @@ import {
   type AcousticProfileId,
   DEFAULT_ACOUSTIC_PROFILE_ID,
 } from './acousticProfiles';
+import type { CustomSoundscape } from './customSoundscapes';
 
 export type ChannelId =
   | 'reactor'
@@ -43,6 +44,7 @@ export interface ChannelState {
 export interface MixerState {
   isActive: boolean;
   activePresetId: ActivePresetState;
+  activeCustomSoundscapeId: string | null;
   acousticProfileId: AcousticProfileId;
   ambientEventsEnabled: boolean;
   masterVolume: number; // 0..1 linear slider value
@@ -155,6 +157,7 @@ export function createInitialMixerState(): MixerState {
   return {
     isActive: false,
     activePresetId: null,
+    activeCustomSoundscapeId: null,
     acousticProfileId: DEFAULT_ACOUSTIC_PROFILE_ID,
     ambientEventsEnabled: false,
     masterVolume: DEFAULT_MASTER_VOLUME,
@@ -174,6 +177,7 @@ export type MixerAction =
   | { type: 'STOP_ALL' }
   | { type: 'RESET' }
   | { type: 'SELECT_PRESET'; presetId: PresetId }
+  | { type: 'LOAD_CUSTOM_SOUNDSCAPE'; soundscape: CustomSoundscape }
   | { type: 'SELECT_ACOUSTIC_PROFILE'; profileId: AcousticProfileId }
   | { type: 'TOGGLE_AMBIENT_EVENTS' }
   | { type: 'TOGGLE_CHANNEL'; channelId: ChannelId }
@@ -231,6 +235,7 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
         isActive: true,
         activePresetId:
           state.activePresetId !== null && changedFromState ? 'custom' : state.activePresetId,
+        activeCustomSoundscapeId: changedFromState ? null : state.activeCustomSoundscapeId,
         channels: nextChannels,
       };
     }
@@ -247,6 +252,7 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
         ...state,
         isActive: false,
         activePresetId: null,
+        activeCustomSoundscapeId: null,
         channels: nextChannels,
       };
     }
@@ -256,7 +262,7 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
       if (!state.isActive) {
         return defaults;
       }
-      // When already listening, restore the balanced default 5-channel mix and clear preset.
+      // When already listening, restore the balanced default mix and clear preset.
       const activeDefaultChannels = { ...defaults.channels };
       for (const ch of CHANNELS) {
         activeDefaultChannels[ch.id] = {
@@ -267,6 +273,7 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
       return {
         isActive: true,
         activePresetId: null,
+        activeCustomSoundscapeId: null,
         acousticProfileId: defaults.acousticProfileId,
         ambientEventsEnabled: false,
         masterVolume: defaults.masterVolume,
@@ -280,6 +287,7 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
       return {
         ...state,
         acousticProfileId: action.profileId,
+        activeCustomSoundscapeId: null,
       };
     }
 
@@ -287,6 +295,7 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
       return {
         ...state,
         ambientEventsEnabled: !state.ambientEventsEnabled,
+        activeCustomSoundscapeId: null,
       };
     }
 
@@ -308,6 +317,54 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
         ...state,
         isActive: anyEnabled,
         activePresetId: preset.id,
+        activeCustomSoundscapeId: null,
+        channels: nextChannels,
+      };
+    }
+
+    case 'LOAD_CUSTOM_SOUNDSCAPE': {
+      const soundscape = action.soundscape;
+      const cfg = soundscape?.config;
+      if (!soundscape || typeof soundscape.id !== 'string' || !cfg || !cfg.channels) {
+        return state;
+      }
+
+      const nextChannels = { ...state.channels };
+      for (const ch of CHANNELS) {
+        const entry = cfg.channels[ch.id];
+        if (
+          !entry ||
+          typeof entry.enabled !== 'boolean' ||
+          typeof entry.volume !== 'number' ||
+          !Number.isFinite(entry.volume)
+        ) {
+          return state;
+        }
+        nextChannels[ch.id] = {
+          enabled: entry.enabled,
+          volume: clampUnit(entry.volume),
+        };
+      }
+
+      const anyEnabled = CHANNELS.some((ch) => nextChannels[ch.id].enabled);
+      const validAcoustic = ACOUSTIC_PROFILES.some(
+        (p) => p.id === cfg.acousticProfileId,
+      )
+        ? cfg.acousticProfileId
+        : DEFAULT_ACOUSTIC_PROFILE_ID;
+      const masterVolume =
+        typeof cfg.masterVolume === 'number' && Number.isFinite(cfg.masterVolume)
+          ? clampUnit(cfg.masterVolume)
+          : state.masterVolume;
+
+      return {
+        ...state,
+        isActive: state.isActive && anyEnabled,
+        activePresetId: 'custom',
+        activeCustomSoundscapeId: soundscape.id,
+        acousticProfileId: validAcoustic,
+        ambientEventsEnabled: Boolean(cfg.ambientEventsEnabled),
+        masterVolume,
         channels: nextChannels,
       };
     }
@@ -327,6 +384,7 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
         ...state,
         isActive: anyEnabled,
         activePresetId: state.activePresetId !== null ? 'custom' : null,
+        activeCustomSoundscapeId: null,
         channels: nextChannels,
       };
     }
@@ -336,6 +394,7 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
       return {
         ...state,
         activePresetId: state.activePresetId !== null ? 'custom' : null,
+        activeCustomSoundscapeId: null,
         channels: {
           ...state.channels,
           [action.channelId]: {
@@ -350,6 +409,7 @@ export function mixerReducer(state: MixerState, action: MixerAction): MixerState
       return {
         ...state,
         masterVolume: clampUnit(action.volume),
+        activeCustomSoundscapeId: null,
       };
     }
 

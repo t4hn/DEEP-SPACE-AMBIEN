@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createCustomSoundscape } from './customSoundscapes';
 import {
   CHANNELS,
   DEFAULT_MASTER_VOLUME,
@@ -331,5 +332,72 @@ test('acousticProfileId defaults to bridge and switches without altering channel
   assert.equal(lab.acousticProfileId, 'research-lab');
   assert.deepEqual(lab.channels, playing.channels);
 });
+
+test('LOAD_CUSTOM_SOUNDSCAPE restores all settings atomically without starting playback from Standby and preserves active playback', () => {
+  // Build a saved configuration that had active channels, custom volumes, master, profile & ambient events
+  let source = createInitialMixerState();
+  source = mixerReducer(source, { type: 'SELECT_PRESET', presetId: 'silent-watch' });
+  source = mixerReducer(source, { type: 'SET_MASTER_VOLUME', volume: 0.44 });
+  source = mixerReducer(source, {
+    type: 'SELECT_ACOUSTIC_PROFILE',
+    profileId: 'engine-room',
+  });
+  source = mixerReducer(source, { type: 'TOGGLE_AMBIENT_EVENTS' });
+  source = mixerReducer(source, {
+    type: 'SET_CHANNEL_VOLUME',
+    channelId: 'hull',
+    volume: 0.77,
+  });
+
+  const saved = createCustomSoundscape([], source, {
+    name: 'Engine Hull Focus',
+    description: 'Night watch in engineering',
+  });
+  assert.equal(saved.ok, true);
+  if (!saved.ok) return;
+  const customSoundscape = saved.value.soundscape;
+
+  // 1. Load while in Standby: restores channels/volumes/master/profile/events WITHOUT starting playback
+  const standby = createInitialMixerState();
+  const loadedInStandby = mixerReducer(standby, {
+    type: 'LOAD_CUSTOM_SOUNDSCAPE',
+    soundscape: customSoundscape,
+  });
+  assert.equal(loadedInStandby.isActive, false);
+  assert.equal(loadedInStandby.activePresetId, 'custom');
+  assert.equal(loadedInStandby.activeCustomSoundscapeId, customSoundscape.id);
+  assert.equal(loadedInStandby.masterVolume, 0.44);
+  assert.equal(loadedInStandby.acousticProfileId, 'engine-room');
+  assert.equal(loadedInStandby.ambientEventsEnabled, true);
+  assert.equal(loadedInStandby.channels.hull.volume, 0.77);
+  assert.equal(loadedInStandby.channels.hull.enabled, true);
+  assert.equal(loadedInStandby.channels.engines.enabled, false);
+  assert.equal(effectiveChannelGain(loadedInStandby, 'hull'), 0);
+
+  // Editing channel clears activeCustomSoundscapeId while keeping CUSTOM state
+  const tweaked = mixerReducer(loadedInStandby, {
+    type: 'SET_CHANNEL_VOLUME',
+    channelId: 'reactor',
+    volume: 0.5,
+  });
+  assert.equal(tweaked.activePresetId, 'custom');
+  assert.equal(tweaked.activeCustomSoundscapeId, null);
+
+  // 2. Load while audio is already playing: preserves active playback and updates settings atomically
+  const playing = mixerReducer(createInitialMixerState(), { type: 'PLAY_ALL' });
+  const loadedWhilePlaying = mixerReducer(playing, {
+    type: 'LOAD_CUSTOM_SOUNDSCAPE',
+    soundscape: customSoundscape,
+  });
+  assert.equal(loadedWhilePlaying.isActive, true);
+  assert.equal(loadedWhilePlaying.activeCustomSoundscapeId, customSoundscape.id);
+  assert.equal(loadedWhilePlaying.masterVolume, 0.44);
+  assert.equal(loadedWhilePlaying.acousticProfileId, 'engine-room');
+  assert.equal(loadedWhilePlaying.ambientEventsEnabled, true);
+  assert.equal(loadedWhilePlaying.channels.engines.enabled, false);
+  assert.equal(effectiveChannelGain(loadedWhilePlaying, 'engines'), 0);
+  assert.ok(effectiveChannelGain(loadedWhilePlaying, 'hull') > 0);
+});
+
 
 

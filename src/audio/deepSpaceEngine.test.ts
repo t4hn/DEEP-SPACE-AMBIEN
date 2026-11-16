@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { getAcousticProfile } from './acousticProfiles';
+import { createCustomSoundscape } from './customSoundscapes';
 import { DeepSpaceEngine } from './deepSpaceEngine';
 import { createInitialMixerState, mixerReducer } from './mixerState';
 import { CHANNEL_SPATIAL_PROFILES } from './spatialLayout';
@@ -790,5 +791,99 @@ test('rapid start/stop toggles cancel previous fade timers cleanly with zero dup
     }
   }
 });
+
+test('loading a custom soundscape in Standby never allocates AudioContext and loading while active updates smoothly without fades', async () => {
+  const prevWindow = (globalThis as Record<string, unknown>).window;
+  let nextTimerId = 1;
+  const timers = new Map<number, { fn: () => void; delay: number }>();
+
+  MockAudioContext.instances = [];
+  (globalThis as Record<string, unknown>).window = {
+    AudioContext: MockAudioContext,
+    location: { search: '' },
+    setTimeout: (fn: () => void, delay = 0) => {
+      const id = nextTimerId++;
+      timers.set(id, { fn, delay });
+      return id;
+    },
+    clearTimeout: (id: number) => {
+      timers.delete(id);
+    },
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  };
+
+  const phases: string[] = [];
+  const engine = new DeepSpaceEngine({
+    onPlaybackPhaseChange: (phase) => phases.push(phase),
+  });
+
+  try {
+    // Build a custom soundscape with Observation Deck + specific levels
+    let source = mixerReducer(createInitialMixerState(), {
+      type: 'SELECT_PRESET',
+      presetId: 'deep-transit',
+    });
+    source = mixerReducer(source, { type: 'SET_MASTER_VOLUME', volume: 0.45 });
+    source = mixerReducer(source, {
+      type: 'SELECT_ACOUSTIC_PROFILE',
+      profileId: 'observation-deck',
+    });
+    const saved = createCustomSoundscape([], source, { name: 'Cruise Snapshot' });
+    assert.equal(saved.ok, true);
+    if (!saved.ok) return;
+
+    // 1. Load while Standby -> AudioContext must remain unallocated, phase stays stopped
+    let state = mixerReducer(createInitialMixerState(), {
+      type: 'LOAD_CUSTOM_SOUNDSCAPE',
+      soundscape: saved.value.soundscape,
+    });
+    await engine.syncState(state);
+    assert.equal(MockAudioContext.instances.length, 0);
+    assert.equal(engine.getPlaybackPhase(), 'stopped');
+    assert.equal(phases.length, 0);
+
+    // 2. Start playback normally, finish 3s fade-in, then load a second custom soundscape while active
+    engine.unlockFromGesture();
+    state = mixerReducer(createInitialMixerState(), { type: 'PLAY_ALL' });
+    await engine.syncState(state);
+    const fadeInTimer = [...timers.entries()].find(([, t]) => t.delay === 3000);
+    assert.ok(fadeInTimer);
+    timers.delete(fadeInTimer[0]);
+    fadeInTimer[1].fn();
+    assert.equal(engine.getPlaybackPhase(), 'active');
+
+    const ctx = MockAudioContext.instances[0];
+    const transitionGain = ctx.nodes[1] as MockGainNode;
+    const transitionCallsBeforeLoad = transitionGain.gain.calls.length;
+    const pannerRefsBeforeLoad = [...ctx.panners];
+
+    ctx.currentTime += 1.0;
+    state = mixerReducer(state, {
+      type: 'LOAD_CUSTOM_SOUNDSCAPE',
+      soundscape: saved.value.soundscape,
+    });
+    await engine.syncState(state);
+
+    // AudioContext & PannerNodes are NOT recreated, no fade transition triggered, acoustic profile updated
+    assert.equal(MockAudioContext.instances.length, 1);
+    assert.deepEqual(ctx.panners, pannerRefsBeforeLoad);
+    assert.equal(engine.getPlaybackPhase(), 'active');
+    assert.deepEqual(phases, ['fading-in', 'active']);
+    assert.equal(transitionGain.gain.calls.length, transitionCallsBeforeLoad);
+
+    const obs = getAcousticProfile('observation-deck');
+    assert.equal(ctx.delays[0].delayTime.value, obs.reflection.delayLeftSec);
+    assert.equal(ctx.delays[1].delayTime.value, obs.reflection.delayRightSec);
+  } finally {
+    engine.dispose();
+    if (prevWindow === undefined) {
+      delete (globalThis as Record<string, unknown>).window;
+    } else {
+      (globalThis as Record<string, unknown>).window = prevWindow;
+    }
+  }
+});
+
 
 

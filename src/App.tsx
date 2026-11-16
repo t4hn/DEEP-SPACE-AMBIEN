@@ -1,6 +1,16 @@
 import { createRef, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { AcousticProfileId } from './audio/acousticProfiles';
 import type { AmbientEventDescriptor } from './audio/ambientEvents';
+import {
+  type CustomSoundscape,
+  type SaveSoundscapeInput,
+  type ValidationResult,
+  createCustomSoundscape,
+  deleteCustomSoundscape,
+  loadCustomSoundscapes,
+  persistCustomSoundscapes,
+  updateCustomSoundscapeMetadata,
+} from './audio/customSoundscapes';
 import { DeepSpaceEngine } from './audio/deepSpaceEngine';
 import {
   CHANNELS,
@@ -64,6 +74,9 @@ export default function App() {
   );
   const [sleepTimer, setSleepTimer] = useState<SleepTimerState>(
     createInitialSleepTimerState,
+  );
+  const [customSoundscapes, setCustomSoundscapes] = useState<CustomSoundscape[]>(() =>
+    loadCustomSoundscapes(),
   );
 
   const testOverrides = useMemo(readTestTransitionOverrides, []);
@@ -280,7 +293,7 @@ export default function App() {
       if (!state.isActive) {
         syncSleepTimerOnPlaybackStart();
       }
-    } else if (countEnabledChannels(state) <= 1) {
+    } else if (state.isActive && countEnabledChannels(state) <= 1) {
       // Disabling the last active channel stops playback manually -> cancel active timer
       setSleepTimer(cancelSleepTimer());
       pendingFadeOutSecRef.current = DEFAULT_FADE_OUT_SEC;
@@ -298,6 +311,49 @@ export default function App() {
       pendingFadeOutSecRef.current = DEFAULT_FADE_OUT_SEC;
     }
     dispatch({ type: 'SELECT_PRESET', presetId });
+  };
+
+  const handleLoadCustomSoundscape = (soundscape: CustomSoundscape) => {
+    // Loading must never start playback automatically, recreate the engine, or interrupt sleep timers.
+    dispatch({ type: 'LOAD_CUSTOM_SOUNDSCAPE', soundscape });
+  };
+
+  const handleSaveCustomSoundscape = (
+    input: SaveSoundscapeInput,
+  ): ValidationResult<CustomSoundscape> => {
+    const result = createCustomSoundscape(customSoundscapes, state, input);
+    if (!result.ok) {
+      return result;
+    }
+    setCustomSoundscapes(result.value.soundscapes);
+    persistCustomSoundscapes(result.value.soundscapes);
+    return { ok: true, value: result.value.soundscape };
+  };
+
+  const handleUpdateCustomSoundscape = (
+    id: string,
+    input: SaveSoundscapeInput,
+  ): ValidationResult<CustomSoundscape> => {
+    const result = updateCustomSoundscapeMetadata(customSoundscapes, id, input);
+    if (!result.ok) {
+      return result;
+    }
+    const updated = result.value.find((s) => s.id === id);
+    if (!updated) {
+      return { ok: false, error: 'Custom soundscape not found.' };
+    }
+    setCustomSoundscapes(result.value);
+    persistCustomSoundscapes(result.value);
+    return { ok: true, value: updated };
+  };
+
+  const handleDeleteCustomSoundscape = (id: string) => {
+    const result = deleteCustomSoundscape(customSoundscapes, id);
+    if (!result.ok) {
+      return;
+    }
+    setCustomSoundscapes(result.value);
+    persistCustomSoundscapes(result.value);
   };
 
   const handleSelectAcousticProfile = (profileId: AcousticProfileId) => {
@@ -422,11 +478,17 @@ export default function App() {
           />
         </div>
 
-        {/* Compact Environment Presets */}
+        {/* Compact Environment Presets & Custom Soundscapes */}
         <div className="mb-3">
           <PresetSelector
             activePresetId={state.activePresetId}
+            activeCustomSoundscapeId={state.activeCustomSoundscapeId}
+            customSoundscapes={customSoundscapes}
             onSelectPreset={handleSelectPreset}
+            onLoadCustomSoundscape={handleLoadCustomSoundscape}
+            onSaveCustomSoundscape={handleSaveCustomSoundscape}
+            onUpdateCustomSoundscape={handleUpdateCustomSoundscape}
+            onDeleteCustomSoundscape={handleDeleteCustomSoundscape}
           />
         </div>
 
